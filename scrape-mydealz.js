@@ -193,10 +193,10 @@ async function main() {
     viewport: { width: 1366, height: 900 },
   });
 
-  // Blocke Assets, die wir für Text nicht brauchen → schneller & stabiler
+  // ⚠️ WICHTIG: Nur Bilder/Media/Fonts blocken – CSS & JS MÜSSEN LADEN!
   await ctx.route("**/*", (route) => {
     const t = route.request().resourceType();
-    if (t === "image" || t === "media" || t === "font" || t === "stylesheet") return route.abort();
+    if (t === "image" || t === "media" || t === "font") return route.abort();
     return route.continue();
   });
 
@@ -284,6 +284,7 @@ async function main() {
     const part = await extractCommentsOnPage(page);
     console.log(`   ausgeklappt: ${clicks} | extrahiert: ${part.length}`);
     all.push(...part);
+    console.log(`   Gesamt-Kommentare bisher: ${all.length}`);
     await sleep(250);
   }
 
