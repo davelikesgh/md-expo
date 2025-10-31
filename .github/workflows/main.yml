@@ -21,7 +21,7 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install dependencies
+      - name: Install system dependencies (Chromium libs)
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -48,7 +48,12 @@ jobs:
             wget \
             libasound2t64 || true
 
-          npm ci
+      - name: Install Node dependencies
+        run: |
+          npm install --no-audit --no-fund
+
+      - name: Install Playwright (Chromium)
+        run: |
           npx playwright install --with-deps chromium || true
 
       - name: Run scraper
