@@ -1,3 +1,4 @@
+// scrape-mydealz.js
 import fs from "fs";
 import path from "path";
 import { chromium } from "playwright-extra";
@@ -6,7 +7,7 @@ import { PDFDocument } from "pdf-lib";
 
 chromium.use(Stealth());
 
-// ---------- Args ----------
+// ---------- CLI / ENV ----------
 function arg(name) {
   const i = process.argv.indexOf(`--${name}`);
   return i >= 0 ? process.argv[i + 1] : null;
@@ -16,9 +17,10 @@ if (!dealUrl || /^--/.test(dealUrl)) {
   console.error('Nutze: node scrape-mydealz.js --url "https://…"');
   process.exit(1);
 }
-const PAGE_PROBE_CAP = Number(arg("cap") || process.env.PAGE_CAP || 5);
+const PAGE_PROBE_CAP = Number(arg("cap") || process.env.PAGE_CAP || 8);
+const FORCE_PAGES = Number(arg("forcePages") || process.env.FORCE_PAGES || 0);
 
-// ---------- Utils ----------
+// ---------- helpers ----------
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function clickCookies(page) {
@@ -56,14 +58,14 @@ async function ensureLoaded(page) {
 async function scrollWarmup(page, ms = 1100) {
   const t0 = Date.now();
   while (Date.now() - t0 < ms) {
-    await page.mouse.wheel(0, 1400);
+    await page.mouse.wheel(0, 1300);
     await wait(90);
   }
 }
 
 async function expandAllReplies(page) {
   let total = 0;
-  for (let round = 0; round < 15; round++) {
+  for (let round = 0; round < 16; round++) {
     const ctrls = await page.locator("button, a, div[role='button']").all();
     let clicked = 0;
     for (const c of ctrls) {
@@ -78,7 +80,7 @@ async function expandAllReplies(page) {
       ) {
         try {
           await c.scrollIntoViewIfNeeded();
-          await c.click({ timeout: 800 });
+          await c.click({ timeout: 900 });
           clicked++; total++;
           await wait(140);
         } catch {}
@@ -90,13 +92,47 @@ async function expandAllReplies(page) {
   return total;
 }
 
-// ALLE sichtbaren Kommentar-IDs sammeln (ohne Replies, die noch zugeklappt sind)
+// --- Kommentar-IDs robust einsammeln (vor dem Ausklappen) ---
 async function collectCommentIds(page) {
-  return await page.$$eval('*[id^="comment-"]', (els) =>
-    els.map((el) => el.id.replace("comment-", "")).filter(Boolean)
-  );
+  const ids = await page.evaluate(() => {
+    const set = new Set();
+    // id="comment-123"
+    document.querySelectorAll('[id^="comment-"]').forEach(el => {
+      const m = el.id.match(/^comment-(\d+)/);
+      if (m) set.add(m[1]);
+    });
+    // data-comment-id
+    document.querySelectorAll("[data-comment-id]").forEach(el => {
+      const v = el.getAttribute("data-comment-id");
+      if (v) set.add(v);
+    });
+    // data-testid enthält "comment"
+    document.querySelectorAll('[data-testid*="comment"]').forEach(el => {
+      const v = el.getAttribute("data-testid");
+      // oft z.B. "comment-123456"
+      const m = v && v.match(/(\d{4,})/);
+      if (m) set.add(m[1]);
+    });
+    // article[data-test="comment"]
+    document.querySelectorAll('article[data-test="comment"]').forEach(el => {
+      // versuche in Unterelementen IDs abzuleiten
+      const byId = el.querySelector('[id^="comment-"]');
+      if (byId) {
+        const m = byId.id.match(/^comment-(\d+)/);
+        if (m) set.add(m[1]);
+      }
+      const byData = el.querySelector("[data-comment-id]");
+      if (byData) {
+        const v = byData.getAttribute("data-comment-id");
+        if (v) set.add(v);
+      }
+    });
+    return Array.from(set);
+  });
+  return ids;
 }
 
+// PNG -> PDF
 async function pngsToPdf(pngPaths, outPath) {
   const pdf = await PDFDocument.create();
   for (const p of pngPaths) {
@@ -111,26 +147,39 @@ async function pngsToPdf(pngPaths, outPath) {
   fs.writeFileSync(outPath, await pdf.save());
 }
 
+// DOM-Pagination lesen (größte Seitenzahl)
 async function readDomMaxPage(page) {
-  const nums = await page.$$eval("a[href*='page='], button[aria-label*='Seite']", (as) =>
-    Array.from(
-      new Set(
-        as
-          .map((a) => {
-            const t = (a.innerText || a.ariaLabel || "").trim();
-            const m = t.match(/\b(\d+)\b/);
-            const u = (a.href || "").match(/page=(\d+)/);
-            return Number((m && m[1]) || (u && u[1]) || 0);
-          })
-          .filter(Boolean)
-      )
-    )
-  );
-  return nums.length ? Math.max(...nums) : 1;
+  // Suche Zahlen in Pagination-Leiste
+  const nums = await page.$$eval("a[href*='page='], button[aria-label*='Seite'], nav, ul", (nodes) => {
+    const set = new Set();
+    nodes.forEach((n) => {
+      const txt = (n.innerText || n.textContent || "").trim();
+      // Zahlen wie "1", "2", "3", "Seite 2", "… 1 2 …"
+      (txt.match(/\b\d+\b/g) || []).forEach((d) => set.add(Number(d)));
+      // Links mit page=N
+      n.querySelectorAll("a[href*='page=']").forEach((a) => {
+        const m = a.href.match(/page=(\d+)/);
+        if (m) set.add(Number(m[1]));
+      });
+    });
+    return Array.from(set);
+  });
+  if (!nums.length) return 1;
+  return Math.max(...nums);
 }
 
-// Seiten entdecken – nur echte neue Inhalte zulassen
+// Seitenliste bestimmen
 async function discoverPages(page, baseUrl) {
+  // Override erlaubt (z. B. --forcePages 2)
+  if (FORCE_PAGES && FORCE_PAGES > 0) {
+    return Array.from({ length: FORCE_PAGES }, (_, i) => {
+      const u = new URL(baseUrl);
+      u.searchParams.set("page", i + 1);
+      u.hash = "comments";
+      return u.toString();
+    });
+  }
+
   await scrollWarmup(page, 600);
   let domMax = await readDomMaxPage(page);
   if (domMax > 1) {
@@ -142,7 +191,8 @@ async function discoverPages(page, baseUrl) {
     });
   }
 
-  const seenIds = new Set();       // alle bisher gesehenen Kommentar-IDs
+  // Fallback mit ID-Vergleich
+  const seenIds = new Set();
   const urls = [];
   const u0 = new URL(baseUrl);
   u0.hash = "comments";
@@ -155,7 +205,6 @@ async function discoverPages(page, baseUrl) {
   ids1.forEach((id) => seenIds.add(id));
   urls.push(u0.toString());
 
-  // Weitere Seiten probieren
   for (let p = 2; p <= PAGE_PROBE_CAP; p++) {
     const u = new URL(baseUrl);
     u.searchParams.set("page", p);
@@ -165,26 +214,22 @@ async function discoverPages(page, baseUrl) {
     await ensureLoaded(page);
     await scrollWarmup(page, 600);
 
-    // Redirect-Check: wirkliche Seite?
+    // tatsächlich auf page=N?
     const real = new URL(page.url());
     const realP = Number(real.searchParams.get("page") || "1");
     if (realP !== p) break;
 
-    // IDs vor dem Ausklappen sammeln (nur „native“ Comments der Seite)
     const ids = await collectCommentIds(page);
     const newIds = ids.filter((id) => !seenIds.has(id));
+    if (newIds.length === 0) break; // keine neuen Kommentare
 
-    if (newIds.length === 0) break; // keine neuen Kommentare → keine echte neue Seite
-
-    // akzeptieren
     newIds.forEach((id) => seenIds.add(id));
     urls.push(u.toString());
   }
-
-  // URLs deduplizieren (Sicherheitsnetz)
   return Array.from(new Set(urls));
 }
 
+// ---------- main ----------
 (async () => {
   const browser = await chromium.launch({ headless: true });
   const ctx = await browser.newContext({
@@ -202,6 +247,7 @@ async function discoverPages(page, baseUrl) {
   await hideOverlays(page);
   await ensureLoaded(page);
 
+  // Cloudflare-Wartefenster?
   if (await page.locator("text=Verifying you are human").isVisible().catch(() => false)) {
     console.log("⚠️ Cloudflare: 10s warten …");
     await wait(10000);
@@ -222,7 +268,6 @@ async function discoverPages(page, baseUrl) {
     await ensureLoaded(page);
     await scrollWarmup(page, 1100);
 
-    // jetzt erst alles ausklappen und rendern
     const expanded = await expandAllReplies(page);
     console.log("   ausgeklappt:", expanded);
 
