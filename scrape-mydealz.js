@@ -17,13 +17,16 @@ if (!dealUrl || /^--/.test(dealUrl)) {
   process.exit(1);
 }
 
+// wie viele Seiten maximal probieren (Sicherheits-Cap)
+const PAGE_PROBE_CAP = Number(getArg("cap") || process.env.PAGE_CAP || 10);
+
 // ---------- Helpers ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function acceptCookies(page) {
   const sels = [
-    "button:has-text('Akzeptieren')",
     "button:has-text('Alle akzeptieren')",
+    "button:has-text('Akzeptieren')",
     "button:has-text('Einverstanden')",
     "[data-testid='uc-accept-all-button']",
   ];
@@ -31,7 +34,7 @@ async function acceptCookies(page) {
     const el = page.locator(s).first();
     if (await el.isVisible().catch(() => false)) {
       await el.click().catch(() => {});
-      await sleep(400);
+      await sleep(300);
       break;
     }
   }
@@ -51,22 +54,30 @@ async function ensureLoaded(page) {
   await page.waitForSelector("h1, [data-test='thread-title']", { timeout: 20000 }).catch(() => {});
 }
 
-async function autoScroll(page, ms = 2000) {
-  const start = Date.now();
-  while (Date.now() - start < ms) {
-    await page.mouse.wheel(0, 1200);
-    await sleep(120);
+async function autoScroll(page, ms = 1500) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    await page.mouse.wheel(0, 1400);
+    await sleep(100);
   }
 }
 
-// klappt „mehr Antworten anzeigen“ & ähnliche, mehrere Runden
+async function getCommentSignature(page) {
+  // nimmt die ersten drei comment-IDs (z.B. id="comment-123456")
+  const ids = await page.$$eval('*[id^="comment-"]', (els) =>
+    els.slice(0, 3).map((e) => e.id)
+  );
+  return ids.join("|");
+}
+
+// klappt „mehr Antworten/mehr anzeigen“ mehrfach
 async function expandAllReplies(page) {
   let total = 0;
-  for (let round = 0; round < 20; round++) {
-    const items = await page.locator("button, a, div[role='button']").all();
+  for (let round = 0; round < 15; round++) {
+    const controls = await page.locator("button, a, div[role='button']").all();
     let clicked = 0;
-    for (const it of items) {
-      const txt = ((await it.textContent()) || "").toLowerCase();
+    for (const c of controls) {
+      const txt = ((await c.textContent()) || "").toLowerCase();
       if (
         txt.includes("mehr antworten anzeigen") ||
         txt.includes("weitere antworten") ||
@@ -76,22 +87,22 @@ async function expandAllReplies(page) {
         txt.includes("view more")
       ) {
         try {
-          await it.scrollIntoViewIfNeeded();
-          await it.click({ timeout: 900 });
+          await c.scrollIntoViewIfNeeded();
+          await c.click({ timeout: 800 });
           clicked++; total++;
-          await sleep(220);
+          await sleep(180);
         } catch {}
       }
     }
     if (!clicked) break;
-    await autoScroll(page, 800);
+    await autoScroll(page, 600);
   }
   return total;
 }
 
 async function screenshotFull(page, file) {
   await page.evaluate(() => window.scrollTo(0, 0));
-  await sleep(150);
+  await sleep(120);
   await page.screenshot({ path: file, fullPage: true });
 }
 
@@ -100,21 +111,20 @@ async function pngsToPdf(pngFiles, out) {
   for (const p of pngFiles) {
     const bytes = fs.readFileSync(p);
     const img = await pdf.embedPng(bytes);
-    const scale = 0.75; // A4-freundliche Größe
+    const scale = 0.75;
     const w = img.width * scale;
     const h = img.height * scale;
-    const page = pdf.addPage([w, h]);
-    page.drawImage(img, { x: 0, y: 0, width: w, height: h });
+    const pg = pdf.addPage([w, h]);
+    pg.drawImage(img, { x: 0, y: 0, width: w, height: h });
   }
   fs.writeFileSync(out, await pdf.save());
 }
 
 // ---- robuste Seitenerkennung ----
 async function discoverAllCommentPages(page, baseUrl) {
-  // 1) DOM-Scan (Paginierung kann unten stehen)
+  // 1) DOM-Scan
   await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-  await sleep(800);
-
+  await sleep(600);
   const domPages = await page.$$eval("a[href*='page=']", (links) =>
     Array.from(
       new Set(
@@ -127,24 +137,33 @@ async function discoverAllCommentPages(page, baseUrl) {
   );
   let max = domPages.length ? Math.max(...domPages) : 1;
 
-  // 2) Fallback: sequentiell probieren (endet sobald Seite „zurückspringt“)
+  // 2) Fallback-Probing mit Signaturvergleich
   if (max < 2) {
-    const urlObj = new URL(baseUrl);
-    for (let p = 2; p <= 50; p++) {
-      const test = new URL(urlObj.toString());
-      test.searchParams.set("page", p);
-      test.hash = "comments";
-      await page.goto(test.toString(), { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
-      // Wenn die URL nach dem Laden NICHT auf page=p steht, gibt es diese Seite nicht
-      const curP = Number(new URL(page.url()).searchParams.get("page") || "1");
-      if (curP !== p) break;
-      max = p;
+    const u0 = new URL(baseUrl);
+    // Signatur der ersten Seite holen
+    const sig1 = await getCommentSignature(page);
+
+    for (let p = 2; p <= PAGE_PROBE_CAP; p++) {
+      const u = new URL(u0.toString());
+      u.searchParams.set("page", p);
+      u.hash = "comments";
+
+      await page.goto(u.toString(), { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+      await ensureLoaded(page);
+      await autoScroll(page, 600);
+
+      const sigN = await getCommentSignature(page);
+      if (!sigN) break;                 // keine Comments → Seite existiert nicht
+      if (sigN === sig1) break;         // gleiche Signatur wie Seite 1 → keine echte Folgeseite
+
+      max = p;                          // echte Folge-Seite gefunden
     }
+
     // zurück auf Seite 1
     await page.goto(baseUrl, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
   }
 
-  // 3) Liste 1..max bauen
+  // 3) Liste bauen
   return Array.from({ length: max }, (_, i) => {
     const u = new URL(baseUrl);
     u.searchParams.set("page", i + 1);
@@ -170,21 +189,18 @@ async function discoverAllCommentPages(page, baseUrl) {
   await acceptCookies(page);
   await hideUI(page);
   await ensureLoaded(page);
+  await autoScroll(page, 1200);
 
-  // Cloudflare warten
+  // Cloudflare?
   if (await page.locator("text=Verifying you are human").isVisible().catch(() => false)) {
     console.log("⚠️ Cloudflare – warte 10s…");
     await sleep(10000);
     await page.reload({ waitUntil: "domcontentloaded" });
   }
 
-  await autoScroll(page, 1500);
-
-  // → alle Kommentar-Unterseiten ermitteln
   const pages = await discoverAllCommentPages(page, dealUrl);
   console.log("→ Kommentar-Unterseiten erkannt:", pages.length);
 
-  // → jede Seite rendern
   const dir = "shots";
   if (!fs.existsSync(dir)) fs.mkdirSync(dir);
   const shots = [];
@@ -195,11 +211,10 @@ async function discoverAllCommentPages(page, baseUrl) {
     await acceptCookies(page);
     await hideUI(page);
     await ensureLoaded(page);
-    await autoScroll(page, 2000);
+    await autoScroll(page, 1500);
 
     const expanded = await expandAllReplies(page);
     console.log("   ausgeklappt:", expanded);
-    await autoScroll(page, 1200);
 
     const file = path.join(dir, `shot-${String(i + 1).padStart(2, "0")}.png`);
     await screenshotFull(page, file);
