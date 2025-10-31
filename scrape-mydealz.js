@@ -1,5 +1,4 @@
-// scrape-mydealz.js — Screenshot-Modus: jede Unterseite voll rendern, alles ausklappen,
-// Vollseiten-Screenshots erstellen und zu einer PDF zusammenfügen.
+// scrape-mydealz.js — Screenshot-Modus (alle Antworten ausklappen + Vollseiten-Screenshots)
 // Usage (wie bisher):
 //   node scrape-mydealz.js --url "https://www.mydealz.de/deals/..."
 
@@ -8,28 +7,35 @@ import path from "path";
 import { chromium } from "playwright";
 import { PDFDocument } from "pdf-lib";
 
-const BTN_TEXT = /(Mehr Antworten anzeigen|Weitere Antworten|Antworten anzeigen|mehr Antworten)/i;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const arg = (name, def = null) => {
   const i = process.argv.indexOf("--" + name);
   return i > 0 ? process.argv[i + 1] : def;
 };
 
+// Texte, die auf Mydealz für „Replies ausklappen“ vorkommen (robust, case-insensitive)
+const REPLY_TEXTS = [
+  "mehr antworten anzeigen",
+  "weitere antworten",
+  "antworten anzeigen",
+  "more replies",          // fallback
+  "view more replies"      // fallback
+];
+
 async function acceptCookies(page) {
-  // Versuche häufige Varianten des Consent-Buttons
   const candidates = [
     "//button[contains(., 'Akzeptieren')]",
     "//button[contains(., 'Alle akzeptieren')]",
     "//button[contains(., 'Zustimmen')]",
     "//button[contains(., 'Einverstanden')]",
-    "button[aria-label*='akzept']",
+    "button[aria-label*='kzept']",
     "[data-testid='uc-accept-all-button']",
   ];
   for (const sel of candidates) {
     try {
-      const el = await page.locator(sel).first();
-      if (await el.isVisible({ timeout: 500 })) {
-        await el.click({ timeout: 500 });
+      const el = page.locator(sel).first();
+      if (await el.isVisible({ timeout: 400 })) {
+        await el.click({ timeout: 400 });
         await sleep(300);
         break;
       }
@@ -38,24 +44,19 @@ async function acceptCookies(page) {
 }
 
 async function hideStickyUI(page) {
-  // Entfernt fixierte Header/Footers/Overlays, damit der Screenshot „ruhig“ ist.
   await page.addStyleTag({
     content: `
       * { scroll-behavior: auto !important; }
       header, .header, .app--header, [data-test*="header"], [data-test*="sticky"],
       .cookie, .consent, [aria-label*="cookie"], .toast, .modal, .Popover, .tooltip,
       .banner, .sticky, .bottom-bar, .top-bar, .gdpr, .newsletter,
-      [class*="cookie"], [class*="consent"], [id*="cookie"] {
-        display: none !important;
-      }
-      ::-webkit-scrollbar{ display:none !important; }
-      body{ scrollbar-width: none !important; }
+      [class*="cookie"], [class*="consent"], [id*="cookie"] { display: none !important; }
+      ::-webkit-scrollbar{ display:none !important; } body{ scrollbar-width: none !important; }
     `,
   });
 }
 
 async function ensureDealLoaded(page) {
-  // Warte bis Titel/Thread geladen ist
   await page.waitForFunction(() => {
     const t1 = document.querySelector("[data-test='thread-title']");
     const h1 = document.querySelector("h1");
@@ -70,47 +71,18 @@ async function ensureDealLoaded(page) {
 
 async function autoScroll(page, { totalMs = 25000, stepPx = 1600, pauseMs = 120 } = {}) {
   const start = Date.now();
-  let lastHeight = await page.evaluate(() => document.documentElement.scrollHeight);
+  let last = await page.evaluate(() => document.documentElement.scrollHeight);
   while (Date.now() - start < totalMs) {
     await page.mouse.wheel(0, stepPx);
     await sleep(pauseMs);
-    const h = await page.evaluate(() => document.documentElement.scrollHeight);
-    if (h <= lastHeight) {
+    const cur = await page.evaluate(() => document.documentElement.scrollHeight);
+    if (cur <= last) {
       await sleep(250);
-      const h2 = await page.evaluate(() => document.documentElement.scrollHeight);
-      if (h2 <= lastHeight) break;
+      const check = await page.evaluate(() => document.documentElement.scrollHeight);
+      if (check <= last) break;
     }
-    lastHeight = h;
+    last = cur;
   }
-}
-
-async function expandAllReplies(page, maxRounds = 14) {
-  let total = 0;
-  const start = Date.now();
-  for (let round = 1; round <= maxRounds; round++) {
-    // Buttons NUR in Kommentaren suchen:
-    const buttons = page
-      .locator("[data-test*='comment'] >> :is(button, a[role='button'], a, div[role='button'])")
-      .filter({ hasText: BTN_TEXT });
-    const n = await buttons.count();
-    if (n === 0) break;
-
-    let clicked = 0;
-    for (let i = 0; i < n; i++) {
-      try {
-        const b = buttons.nth(i);
-        await b.scrollIntoViewIfNeeded();
-        await b.click({ timeout: 900 });
-        clicked++;
-        total++;
-        await sleep(60);
-      } catch {}
-      if (Date.now() - start > 60_000) break;
-    }
-    if (clicked === 0 || Date.now() - start > 60_000) break;
-    await sleep(250);
-  }
-  return total;
 }
 
 function buildPageUrl(base, n) {
@@ -121,7 +93,6 @@ function buildPageUrl(base, n) {
 }
 
 async function detectPages(page, startUrl) {
-  // 1) DOM-Pagination versuchen
   await autoScroll(page, { totalMs: 1500 });
   const maxDom = await page.evaluate(() => {
     const isVisible = (el) => {
@@ -145,25 +116,10 @@ async function detectPages(page, startUrl) {
     return Array.from({ length: n }, (_, i) => buildPageUrl(startUrl, i + 1));
   }
 
-  // 2) Fallback: sequentiell prüfen bis sich der erste Kommentar wiederholt
+  // Fallback: sequential probe bis sich erster Kommentar wiederholt
   const urls = [buildPageUrl(startUrl, 1)];
-  let lastSig = await page.evaluate(() => {
-    const c = document.querySelector("[data-test*='comment'], [id^='comment'], .c-comment, .comment");
-    if (!c) return "";
-    const pick = (el) => (el ? (el.innerText || el.textContent || "").trim() : "");
-    const a = pick(c.querySelector("a[href*='/profil'], [rel='author'], [data-test*='author'], [class*='author']"));
-    const t = c.querySelector("time");
-    const d = (t?.getAttribute("datetime") || (t?.textContent || "").trim() || "");
-    const b = pick(c.querySelector("[data-test*='body'], [class*='body'], [class*='content'], .md, .markdown, p") || c);
-    return `${a}|${d}|${b.slice(0, 60)}`;
-  });
-
-  for (let i = 2; i <= 50; i++) {
-    const test = buildPageUrl(startUrl, i);
-    await page.goto(test, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
-    await ensureDealLoaded(page);
-    await autoScroll(page, { totalMs: 3000 });
-    const sig = await page.evaluate(() => {
+  const firstSig = async () =>
+    await page.evaluate(() => {
       const c = document.querySelector("[data-test*='comment'], [id^='comment'], .c-comment, .comment");
       if (!c) return "";
       const pick = (el) => (el ? (el.innerText || el.textContent || "").trim() : "");
@@ -173,30 +129,92 @@ async function detectPages(page, startUrl) {
       const b = pick(c.querySelector("[data-test*='body'], [class*='body'], [class*='content'], .md, .markdown, p") || c);
       return `${a}|${d}|${b.slice(0, 60)}`;
     });
-    if (!sig || sig === lastSig) break;
+
+  let last = await firstSig();
+  for (let i = 2; i <= 50; i++) {
+    const test = buildPageUrl(startUrl, i);
+    await page.goto(test, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+    await ensureDealLoaded(page);
+    await autoScroll(page, { totalMs: 2000 });
+    const sig = await firstSig();
+    if (!sig || sig === last) break;
     urls.push(test);
-    lastSig = sig;
+    last = sig;
   }
   return urls;
 }
 
-async function screenshotPage(page, filePath) {
-  // Fokus oben
+/* ----------------- HARTNÄCKIGES AUSKLAPPEN ----------------- */
+function makeReplyLocator(page) {
+  // erst nur in Kommentaren suchen (robuster)
+  const container = "[data-test*='comment'], [id^='comment'], .c-comment, .comment";
+  // :has-text ist case-insensitive; vor allem auf „Mehr Antworten anzeigen“ achten
+  const parts = REPLY_TEXTS.map(t => `${container} >> :is(button,a,div[role='button'])[has-text('${t}')]`);
+  // zusätzlich sehr breite Fallback-Suche (falls DOM-Struktur anders ist)
+  parts.push(`:is(button,a,div[role='button'])[has-text('Mehr Antworten anzeigen')]`);
+  parts.push(`:is(button,a,div[role='button'])[has-text('Weitere Antworten')]`);
+  return page.locator(parts.join(", "));
+}
+
+async function expandAllReplies(page, { maxRounds = 20, scrollBetween = true } = {}) {
+  let totalClicked = 0;
+  const start = Date.now();
+
+  for (let round = 1; round <= maxRounds; round++) {
+    const loc = makeReplyLocator(page);
+    let n = await loc.count();
+    if (n === 0) {
+      // evtl. erst durch Scrollen sichtbar machen
+      await autoScroll(page, { totalMs: 1200, stepPx: 1800, pauseMs: 100 });
+      n = await loc.count();
+      if (n === 0) break;
+    }
+
+    let clickedThisRound = 0;
+    for (let i = 0; i < n; i++) {
+      try {
+        const b = loc.nth(i);
+        if (!(await b.isVisible())) continue;
+        await b.scrollIntoViewIfNeeded();
+        await b.click({ timeout: 1000 });
+        clickedThisRound++;
+        totalClicked++;
+        // kurzer Wait, damit DOM die neuen Antworten rendert
+        await sleep(120);
+      } catch {}
+      if (Date.now() - start > 90_000) break; // safety break
+    }
+
+    // falls wir geklickt haben, nochmal scrollen, um neue Buttons nachzuladen
+    if (clickedThisRound > 0 && scrollBetween) {
+      await autoScroll(page, { totalMs: 1400, stepPx: 2000, pauseMs: 90 });
+    }
+
+    if (clickedThisRound === 0 || Date.now() - start > 90_000) break;
+  }
+
+  // letzter Durchlauf: ganz nach unten, dann nochmal ganz nach oben
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  await sleep(200);
   await page.evaluate(() => window.scrollTo(0, 0));
   await sleep(200);
-  // Vollseite
+
+  return totalClicked;
+}
+
+/* ----------------- Screenshots & PDF ----------------- */
+async function screenshotPage(page, filePath) {
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await sleep(200);
   await page.screenshot({ path: filePath, fullPage: true, type: "png" });
 }
 
-/* ---------- PDF aus PNGs ---------- */
 async function pngsToPdf(pngPaths, outputPath) {
   const pdf = await PDFDocument.create();
   for (const p of pngPaths) {
     const bytes = fs.readFileSync(p);
     const img = await pdf.embedPng(bytes);
-    // PDF arbeitet in Punkten (72 dpi). Playwright liefert ~CSS-Pixel (96 dpi).
-    // Um Seitenlänge korrekt abzubilden: Punkte = Pixel * (72/96) = px * 0.75
-    const wPt = img.width * 0.75;
+    const wPt = img.width * 0.75;     // 96 CSS px -> 72 pt
     const hPt = img.height * 0.75;
     const page = pdf.addPage([wPt, hPt]);
     page.drawImage(img, { x: 0, y: 0, width: wPt, height: hPt });
@@ -219,11 +237,10 @@ async function main() {
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
   });
 
-  // CSS & JS zulassen; schwere Medien blocken
+  // Bilder zulassen (wir wollen exakte Optik), nur Medien/Fonts blocken
   await ctx.route("**/*", (route) => {
     const t = route.request().resourceType();
     if (t === "media" || t === "font") return route.abort();
-    // Bilder lassen wir an – wir wollen visuell exakt rendern
     return route.continue();
   });
 
@@ -235,9 +252,8 @@ async function main() {
   await acceptCookies(page);
   await hideStickyUI(page);
   await ensureDealLoaded(page);
-  await autoScroll(page, { totalMs: 4000 });
+  await autoScroll(page, { totalMs: 3000 });
 
-  // Kommentar-Seiten erkennen
   const pages = await detectPages(page, page.url());
   console.log(`→ Kommentar-Unterseiten erkannt: ${pages.length}`);
 
@@ -253,11 +269,13 @@ async function main() {
     await hideStickyUI(page);
     await ensureDealLoaded(page);
 
-    // Alles laden und Antworten ausklappen
-    await autoScroll(page, { totalMs: 6000 });
-    await expandAllReplies(page, 14);
-    // Nochmals scrollen, damit frisch geladene Replies sichtbar sind
-    await autoScroll(page, { totalMs: 4000 });
+    // Erst alles laden …
+    await autoScroll(page, { totalMs: 5000 });
+    // … dann mit „starkem“ Verfahren ALLE Antworten ausklappen
+    const clicks = await expandAllReplies(page, { maxRounds: 20, scrollBetween: true });
+    console.log(`   ausgeklappt: ${clicks}`);
+    // Noch einmal scrollen, damit frisch geöffnetes im DOM fix ist
+    await autoScroll(page, { totalMs: 2500 });
 
     const file = path.join(tmpDir, `shot-${String(i + 1).padStart(2, "0")}.png`);
     await screenshotPage(page, file);
@@ -265,7 +283,6 @@ async function main() {
     console.log(`   ✓ Screenshot: ${file}`);
   }
 
-  // PNGs -> PDF
   const output = "mydealz-output.pdf";
   await pngsToPdf(pngPaths, output);
   console.log(`\n✓ PDF erstellt: ${output} (Seiten: ${pngPaths.length})`);
