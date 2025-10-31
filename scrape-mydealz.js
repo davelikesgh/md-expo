@@ -305,38 +305,83 @@ async function main() {
     });
   }
 
-  async function findAllPagesRobust(startUrl) {
-    // 1) DOM auslesen (bevorzugt)
-    let maxDom = await detectMaxPageFromDomDeep();
-    if (maxDom > 1) {
-      console.log(`   Pagination im DOM erkannt: ${maxDom} Seiten`);
-      return Array.from({ length: maxDom }, (_, i) => buildPageUrl(startUrl, i + 1));
-    }
-
-    // 2) Fallback: sequentiell mit Duplikaterkennung ("Clamp" auf letzter Seite)
-    console.log("   Keine Pagination im DOM gefunden – probiere sequentiell …");
-    const urls = [buildPageUrl(startUrl, 1)];
-    await nav(urls[0]);
-    let lastSig = await firstCommentSignature();
-
-    const MAX_PROBE = 200;
-    for (let requested = 2; requested <= MAX_PROBE; requested++) {
-      const probe = buildPageUrl(startUrl, requested);
-      await nav(probe);
-
-      const sig = await firstCommentSignature();
-      if (!sig || sig === lastSig) {
-        const max = urls.length; // letzte echte Seite ist die bisherige Länge
-        console.log(`   Clamp/Ende erkannt – letzte gültige Seite: ${max}`);
-        return urls;
-      }
-
-      urls.push(probe);
-      lastSig = sig;
-      await sleep(120);
-    }
-    return urls;
+async function findAllPagesRobust(startUrl) {
+  function buildPageUrl(base, n) {
+    const u = new URL(base);
+    u.searchParams.set("page", String(n));
+    if (!u.hash) u.hash = "comments";
+    return u.toString();
   }
+
+  // Scrolle etwas, um Pagination sicher zu laden
+  async function scrollToBottom() {
+    for (let i = 0; i < 10; i++) {
+      await page.mouse.wheel(0, 1500);
+      await sleep(100);
+    }
+  }
+
+  console.log("   Suche Pagination im DOM …");
+  await scrollToBottom();
+
+  // --- 1️⃣ Versuch: sichere DOM-Erkennung ---
+  let maxPage = await page.evaluate(() => {
+    const links = Array.from(document.querySelectorAll("a[href*='page=']"))
+      .filter((a) => {
+        const style = window.getComputedStyle(a);
+        const visible =
+          style.display !== "none" &&
+          style.visibility !== "hidden" &&
+          style.opacity !== "0" &&
+          !a.closest("[hidden],[aria-hidden='true']");
+        return visible;
+      })
+      .map((a) => {
+        const href = a.getAttribute("href") || "";
+        const match = href.match(/[?&]page=(\d+)/);
+        return match ? parseInt(match[1], 10) : null;
+      })
+      .filter((n) => n && n <= 100);
+
+    const texts = Array.from(document.querySelectorAll("a, span"))
+      .map((el) => parseInt(el.textContent.trim(), 10))
+      .filter((n) => n && n <= 100);
+
+    const max = Math.max(...links, ...texts, 1);
+    return isFinite(max) ? max : 1;
+  });
+
+  if (maxPage > 1 && maxPage < 50) {
+    console.log(`   Pagination im DOM erkannt: ${maxPage} Seiten`);
+    return Array.from({ length: maxPage }, (_, i) => buildPageUrl(startUrl, i + 1));
+  }
+
+  // --- 2️⃣ Fallback: sichere Sequenz-Prüfung mit "Clamp"-Erkennung ---
+  console.log("   DOM-Erkennung unklar – prüfe Seiten sequentiell …");
+
+  const urls = [buildPageUrl(startUrl, 1)];
+  await nav(urls[0]);
+  let lastSig = await firstCommentSignature();
+
+  const MAX_PROBE = 50;
+  for (let i = 2; i <= MAX_PROBE; i++) {
+    const test = buildPageUrl(startUrl, i);
+    await nav(test);
+    const sig = await firstCommentSignature();
+
+    if (!sig || sig === lastSig) {
+      console.log(`   Ende erkannt – letzte gültige Seite: ${i - 1}`);
+      return urls;
+    }
+
+    urls.push(test);
+    lastSig = sig;
+    await sleep(150);
+  }
+
+  console.log("   Maximale Prüftiefe erreicht – vermutlich letzte Seite 50.");
+  return urls;
+}
 
   const pages = await findAllPagesRobust(page.url());
   console.log(`==> Gefundene Seiten: ${pages.length}`);
