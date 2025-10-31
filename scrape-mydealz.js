@@ -4,8 +4,9 @@
 import fs from "fs";
 import { chromium } from "playwright";
 import { PDFDocument, rgb } from "pdf-lib";
+import fontkit from "@pdf-lib/fontkit";
 
-// Nur echte Reply-Expander (bewusst eng gefasst)
+// Nur echte Reply-Expander
 const BTN_TEXT = /(Mehr Antworten anzeigen|Weitere Antworten)/i;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const arg = (name, def = null) => {
@@ -18,8 +19,7 @@ async function extractDealInfo(page) {
   return await page.evaluate(() => {
     const pick = (el) => (el ? (el.innerText || el.textContent || "").trim() : "");
     const titleEl =
-      document.querySelector("[data-test='thread-title']") ||
-      document.querySelector("h1");
+      document.querySelector("[data-test='thread-title']") || document.querySelector("h1");
     const descEl =
       document.querySelector("[data-test*='description'], .threadBody, article .content, .userHtml") ||
       document.querySelector("article");
@@ -30,7 +30,7 @@ async function extractDealInfo(page) {
     return {
       title: pick(titleEl) || "Mydealz Thread",
       description: pick(descEl),
-      images: imgs,
+      images: imgs
     };
   });
 }
@@ -69,22 +69,35 @@ async function extractCommentsOnPage(page) {
         datetime: (timeEl?.getAttribute("datetime") || txt(timeEl)) || "—",
         score: (scoreEl?.getAttribute?.("aria-label") || txt(scoreEl)) || "",
         text: t,
-        depth: depthOf(el),
+        depth: depthOf(el)
       });
     }
     return out;
   });
 }
 
-/* -------------------- PDF (mit Unicode-Font) -------------------- */
+/* -------------------- PDF (Unicode-Font mit fontkit) -------------------- */
+function findFontPath() {
+  const candidates = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+  ];
+  for (const p of candidates) {
+    try { if (fs.existsSync(p)) return p; } catch {}
+  }
+  throw new Error("Kein Unicode-Font gefunden (DejaVuSans / NotoSans).");
+}
+
 async function buildPDF({ deal, comments, output = "mydealz-output.pdf" }) {
   const pdf = await PDFDocument.create();
+  pdf.registerFontkit(fontkit);
 
-  // Lade DejaVuSans (enthält Umlaute und Emojis)
-  const fontBytes = fs.readFileSync("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf");
-  const font = await pdf.embedFont(fontBytes);
+  const fontPath = findFontPath();
+  const fontBytes = fs.readFileSync(fontPath);
+  const font = await pdf.embedFont(fontBytes, { subset: true });
 
-  let page = pdf.addPage([595.28, 841.89]);
+  let page = pdf.addPage([595.28, 841.89]); // A4
   const margin = 36;
   const lineH = 12;
   const maxWidth = page.getWidth() - margin * 2;
@@ -110,7 +123,7 @@ async function buildPDF({ deal, comments, output = "mydealz-output.pdf" }) {
     return lines.flatMap((ln) => ln.split(/\n/));
   };
 
-  const draw = (text, { size = 10, color = rgb(0, 0, 0), indent = 0, bold = false } = {}) => {
+  const draw = (text, { size = 10, color = rgb(0, 0, 0), indent = 0 } = {}) => {
     const width = maxWidth - indent;
     const lines = wrap(text, font, size, width);
     for (const ln of lines) {
@@ -146,7 +159,7 @@ async function buildPDF({ deal, comments, output = "mydealz-output.pdf" }) {
   return output;
 }
 
-/* -------------------- Expand replies -------------------- */
+/* -------------------- Expand replies (präzise & schnell) -------------------- */
 async function expandAllReplies(page, maxRounds = 15) {
   const PAGE_MAX_MS = 90_000;
   const t0 = Date.now();
@@ -202,9 +215,10 @@ async function main() {
   const browser = await chromium.launch({ headless: true });
   const ctx = await browser.newContext({
     userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    viewport: { width: 1366, height: 900 },
+    viewport: { width: 1366, height: 900 }
   });
 
+  // CSS/JS erlauben, nur Images/Media/Fonts blocken
   await ctx.route("**/*", (route) => {
     const t = route.request().resourceType();
     if (t === "image" || t === "media" || t === "font") return route.abort();
@@ -216,11 +230,8 @@ async function main() {
 
   async function nav(u) {
     console.log("→ Lade:", u);
-    try {
-      await page.goto(u, { waitUntil: "domcontentloaded", timeout: 60000 });
-    } catch (e) {
-      console.log("   goto warn:", e.message);
-    }
+    try { await page.goto(u, { waitUntil: "domcontentloaded", timeout: 60000 }); }
+    catch (e) { console.log("   goto warn:", e.message); }
     await sleep(500);
   }
 
@@ -256,13 +267,17 @@ async function main() {
     let maxPage = await page.evaluate(() => {
       const isVisible = (el) => {
         const cs = getComputedStyle(el);
-        return !(cs.display === "none" || cs.visibility === "hidden" || cs.opacity === "0");
+        if (cs.display === "none" || cs.visibility === "hidden" || cs.opacity === "0") return false;
+        if (el.closest("[hidden],[aria-hidden='true']")) return false;
+        return true;
       };
       const nums = [];
       document.querySelectorAll("a[href*='page=']").forEach((a) => {
         if (!isVisible(a)) return;
         const m = (a.getAttribute("href") || "").match(/[?&]page=(\d+)/);
         if (m) nums.push(parseInt(m[1], 10));
+        const t = parseInt((a.textContent || "").trim(), 10);
+        if (!Number.isNaN(t)) nums.push(t);
       });
       const max = nums.length ? Math.max(...nums) : 1;
       return Math.max(1, Math.min(max, 50));
@@ -277,6 +292,7 @@ async function main() {
     const urls = [buildPageUrl(startUrl, 1)];
     await nav(urls[0]);
     let lastSig = await firstCommentSignature();
+
     for (let i = 2; i <= 50; i++) {
       const test = buildPageUrl(startUrl, i);
       await nav(test);
