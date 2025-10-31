@@ -5,7 +5,8 @@ import fs from "fs";
 import { chromium } from "playwright";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 
-const BTN_TEXT = /(Mehr Antworten anzeigen|Weitere Antworten|Mehr Kommentare|Mehr anzeigen|Antworten anzeigen)/i;
+// Nur echte Reply-Expander (bewusst eng gefasst)
+const BTN_TEXT = /(Mehr Antworten anzeigen|Weitere Antworten)/i;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const arg = (name, def = null) => {
@@ -38,8 +39,9 @@ async function extractDealInfo(page) {
 async function extractCommentsOnPage(page) {
   return await page.evaluate(() => {
     const out = [];
+    // Engerer Selektor: nur echte Kommentar-Container
     const nodes = document.querySelectorAll(
-      "[data-test*='comment'], [id^='comment'], article, li, .comment, .c-comment"
+      "[data-test*='comment'], [id^='comment'], .c-comment, .comment"
     );
 
     const txt = (el) => (el?.innerText || el?.textContent || "").trim();
@@ -82,7 +84,7 @@ async function buildPDF({ deal, comments, output = "mydealz-output.pdf" }) {
   const font = await pdf.embedFont(StandardFonts.Helvetica);
   const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
 
-  let page = pdf.addPage([595.28, 841.89]); // A4 portrait in pt
+  let page = pdf.addPage([595.28, 841.89]); // A4 portrait (pt)
   const margin = 36;
   const lineH = 12;
   const maxWidth = page.getWidth() - margin * 2;
@@ -153,29 +155,50 @@ async function buildPDF({ deal, comments, output = "mydealz-output.pdf" }) {
   return output;
 }
 
-/* -------------------- Expand replies -------------------- */
-async function expandAllReplies(page, maxRounds = 50) {
+/* -------------------- Expand replies (präzise & schnell) -------------------- */
+async function expandAllReplies(page, maxRounds = 15) {
+  const PAGE_MAX_MS = 90_000; // max. 90s pro Seite
+  const t0 = Date.now();
+
   let total = 0;
   for (let round = 1; round <= maxRounds; round++) {
-    for (let i = 0; i < 10; i++) { await page.mouse.wheel(0, 1600); await sleep(120); }
-    const btns = page
-      .locator("button, a[role='button'], a, div[role='button']")
+    // sanft scrollen, damit Lazy-Buttons sichtbar werden
+    for (let i = 0; i < 6; i++) { await page.mouse.wheel(0, 1400); await sleep(80); }
+
+    // Nur Buttons innerhalb von Kommentarcontainern
+    const buttons = page
+      .locator("[data-test*='comment'] >> :is(button, a[role='button'], a, div[role='button'])")
       .filter({ hasText: BTN_TEXT });
 
+    let n = await buttons.count();
+    if (n === 0) {
+      await sleep(200);
+      n = await buttons.count();
+      if (n === 0) break;
+    }
+
     let clicked = 0;
-    const n = await btns.count();
     for (let i = 0; i < n; i++) {
       try {
-        const b = btns.nth(i);
+        const b = buttons.nth(i);
         await b.scrollIntoViewIfNeeded();
-        await b.click({ timeout: 3000 });
-        clicked++; total++;
-        await sleep(80);
-      } catch {}
+        await b.click({ timeout: 1000 }); // kurz halten
+        clicked++;
+        total++;
+        await sleep(60);
+      } catch {
+        // Fehlklicks ignorieren
+      }
+      if (Date.now() - t0 > PAGE_MAX_MS) break;
     }
+
     console.log(`expand: Runde ${round} — geklickt ${clicked} (gesamt ${total})`);
     if (clicked === 0) break;
-    await sleep(300);
+    if (Date.now() - t0 > PAGE_MAX_MS) {
+      console.log("   Abbruch: Zeitlimit pro Seite erreicht");
+      break;
+    }
+    await sleep(200);
   }
   return total;
 }
@@ -196,7 +219,7 @@ async function main() {
     viewport: { width: 1366, height: 900 },
   });
 
-  // WICHTIG: Nur Bilder/Media/Fonts blocken – CSS & JS müssen laden
+  // Nur Bilder/Media/Fonts blocken – CSS & JS müssen laden
   await ctx.route("**/*", (route) => {
     const t = route.request().resourceType();
     if (t === "image" || t === "media" || t === "font") return route.abort();
@@ -207,7 +230,6 @@ async function main() {
   page.setDefaultTimeout(120000);
   page.setDefaultNavigationTimeout(60000);
 
-  // robuster Nav-Wrapper (statt networkidle)
   async function nav(u) {
     console.log("→ Lade:", u);
     try {
@@ -232,7 +254,7 @@ async function main() {
 
   const deal = await extractDealInfo(page);
 
-  /* -------------------- Robuste Pagination -------------------- */
+  /* -------------------- Pagination -------------------- */
   function buildPageUrl(base, n) {
     const u = new URL(base);
     u.searchParams.set("page", String(n));
@@ -240,57 +262,11 @@ async function main() {
     return u.toString();
   }
 
-  async function scrollToBottom() {
-    for (let i = 0; i < 25; i++) {
-      await page.mouse.wheel(0, 1600);
-      await sleep(120);
-    }
-  }
-
-  async function detectMaxPageFromDomDeep() {
-    await scrollToBottom();
-    return await page.evaluate(() => {
-      const nums = [];
-
-      // Links mit page=
-      document.querySelectorAll("a[href*='page=']").forEach((a) => {
-        const href = a.getAttribute("href") || "";
-        const m = href.match(/[?&]page=(\d+)/);
-        if (m) nums.push(parseInt(m[1], 10));
-      });
-
-      // Pagination-Container: größte sichtbare Zahl
-      const containers = Array.from(
-        document.querySelectorAll(
-          "nav[aria-label*='Pagination' i], .pagination, [class*='Pagination'], [data-test*='pagination']"
-        )
-      );
-      if (containers.length) {
-        containers.forEach((c) => {
-          const text = (c.innerText || c.textContent || "").replace(/\s+/g, " ");
-          (text.match(/\d+/g) || []).forEach((n) => nums.push(parseInt(n, 10)));
-        });
-      }
-
-      // Fallback: gesamte Seite (realistische Begrenzung)
-      if (nums.length === 0) {
-        const txt = (document.body.innerText || "").replace(/\s+/g, " ");
-        (txt.match(/\d+/g) || []).forEach((n) => {
-          const v = parseInt(n, 10);
-          if (v >= 2 && v <= 200) nums.push(v);
-        });
-      }
-
-      const max = nums.length ? Math.max(...nums.filter((x) => !Number.isNaN(x))) : 1;
-      return Math.max(1, Math.min(max, 200));
-    });
-  }
-
   async function firstCommentSignature() {
     return await page.evaluate(() => {
       const n =
         document.querySelector(
-          "[data-test*='comment'], [id^='comment'], article, li, .comment, .c-comment"
+          "[data-test*='comment'], [id^='comment'], .c-comment, .comment"
         ) || null;
       if (!n) return "";
       const pick = (el) => (el ? (el.innerText || el.textContent || "").trim() : "");
@@ -305,83 +281,75 @@ async function main() {
     });
   }
 
-async function findAllPagesRobust(startUrl) {
-  function buildPageUrl(base, n) {
-    const u = new URL(base);
-    u.searchParams.set("page", String(n));
-    if (!u.hash) u.hash = "comments";
-    return u.toString();
-  }
+  async function findAllPagesRobust(startUrl) {
+    // Kleine Scrolls, damit Pagination sichtbar wird
+    for (let i = 0; i < 10; i++) { await page.mouse.wheel(0, 1500); await sleep(100); }
 
-  // Scrolle etwas, um Pagination sicher zu laden
-  async function scrollToBottom() {
-    for (let i = 0; i < 10; i++) {
-      await page.mouse.wheel(0, 1500);
-      await sleep(100);
-    }
-  }
+    console.log("   Suche Pagination im DOM …");
+    let maxPage = await page.evaluate(() => {
+      const isVisible = (el) => {
+        const cs = getComputedStyle(el);
+        if (cs.display === "none" || cs.visibility === "hidden" || cs.opacity === "0") return false;
+        if (el.closest("[hidden],[aria-hidden='true']")) return false;
+        return true;
+      };
 
-  console.log("   Suche Pagination im DOM …");
-  await scrollToBottom();
+      const nums = [];
 
-  // --- 1️⃣ Versuch: sichere DOM-Erkennung ---
-  let maxPage = await page.evaluate(() => {
-    const links = Array.from(document.querySelectorAll("a[href*='page=']"))
-      .filter((a) => {
-        const style = window.getComputedStyle(a);
-        const visible =
-          style.display !== "none" &&
-          style.visibility !== "hidden" &&
-          style.opacity !== "0" &&
-          !a.closest("[hidden],[aria-hidden='true']");
-        return visible;
-      })
-      .map((a) => {
+      // sichtbare Links mit page=
+      document.querySelectorAll("a[href*='page=']").forEach((a) => {
+        if (!isVisible(a)) return;
         const href = a.getAttribute("href") || "";
-        const match = href.match(/[?&]page=(\d+)/);
-        return match ? parseInt(match[1], 10) : null;
-      })
-      .filter((n) => n && n <= 100);
+        const m = href.match(/[?&]page=(\d+)/);
+        if (m) nums.push(parseInt(m[1], 10));
+        const t = parseInt((a.textContent || "").trim(), 10);
+        if (!Number.isNaN(t)) nums.push(t);
+      });
 
-    const texts = Array.from(document.querySelectorAll("a, span"))
-      .map((el) => parseInt(el.textContent.trim(), 10))
-      .filter((n) => n && n <= 100);
+      // typische Container
+      document
+        .querySelectorAll("nav[aria-label*='Pagination' i], .pagination, [class*='Pagination'], [data-test*='pagination']")
+        .forEach((c) => {
+          if (!isVisible(c)) return;
+          const m = (c.innerText || "").match(/\b\d+\b/g) || [];
+          m.forEach((s) => {
+            const n = parseInt(s, 10);
+            if (!Number.isNaN(n)) nums.push(n);
+          });
+        });
 
-    const max = Math.max(...links, ...texts, 1);
-    return isFinite(max) ? max : 1;
-  });
+      const max = nums.length ? Math.max(...nums) : 1;
+      return Math.max(1, Math.min(max, 50)); // Obergrenze 50
+    });
 
-  if (maxPage > 1 && maxPage < 50) {
-    console.log(`   Pagination im DOM erkannt: ${maxPage} Seiten`);
-    return Array.from({ length: maxPage }, (_, i) => buildPageUrl(startUrl, i + 1));
-  }
-
-  // --- 2️⃣ Fallback: sichere Sequenz-Prüfung mit "Clamp"-Erkennung ---
-  console.log("   DOM-Erkennung unklar – prüfe Seiten sequentiell …");
-
-  const urls = [buildPageUrl(startUrl, 1)];
-  await nav(urls[0]);
-  let lastSig = await firstCommentSignature();
-
-  const MAX_PROBE = 50;
-  for (let i = 2; i <= MAX_PROBE; i++) {
-    const test = buildPageUrl(startUrl, i);
-    await nav(test);
-    const sig = await firstCommentSignature();
-
-    if (!sig || sig === lastSig) {
-      console.log(`   Ende erkannt – letzte gültige Seite: ${i - 1}`);
-      return urls;
+    if (maxPage > 1 && maxPage <= 50) {
+      console.log(`   Pagination im DOM erkannt: ${maxPage} Seiten`);
+      return Array.from({ length: maxPage }, (_, i) => buildPageUrl(startUrl, i + 1));
     }
 
-    urls.push(test);
-    lastSig = sig;
-    await sleep(150);
-  }
+    // Fallback: sequentiell prüfen, Clamp über ersten Kommentar
+    console.log("   DOM-Erkennung unklar – prüfe Seiten sequentiell …");
+    const urls = [buildPageUrl(startUrl, 1)];
+    await nav(urls[0]);
+    let lastSig = await firstCommentSignature();
 
-  console.log("   Maximale Prüftiefe erreicht – vermutlich letzte Seite 50.");
-  return urls;
-}
+    const MAX_PROBE = 50;
+    for (let i = 2; i <= MAX_PROBE; i++) {
+      const test = buildPageUrl(startUrl, i);
+      await nav(test);
+      const sig = await firstCommentSignature();
+      if (!sig || sig === lastSig) {
+        console.log(`   Ende erkannt – letzte gültige Seite: ${i - 1}`);
+        return urls;
+      }
+      urls.push(test);
+      lastSig = sig;
+      await sleep(150);
+    }
+
+    console.log("   Maximale Prüftiefe erreicht – vermutlich letzte Seite 50.");
+    return urls;
+  }
 
   const pages = await findAllPagesRobust(page.url());
   console.log(`==> Gefundene Seiten: ${pages.length}`);
@@ -392,7 +360,7 @@ async function findAllPagesRobust(startUrl) {
     const p = pages[i];
     console.log(`\n=== Seite ${i + 1}/${pages.length} ===`);
     await nav(p);
-    const clicks = await expandAllReplies(page, 50);
+    const clicks = await expandAllReplies(page, 15);
     const part = await extractCommentsOnPage(page);
     console.log(`   ausgeklappt: ${clicks} | extrahiert: ${part.length}`);
     all.push(...part);
