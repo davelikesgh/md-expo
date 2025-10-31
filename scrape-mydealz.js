@@ -1,68 +1,191 @@
 import fs from "fs";
 import path from "path";
 import { chromium } from "playwright-extra";
-import StealthPlugin from "puppeteer-extra-plugin-stealth";
+import Stealth from "puppeteer-extra-plugin-stealth";
+import { PDFDocument } from "pdf-lib";
 
-chromium.use(StealthPlugin());
+chromium.use(Stealth());
 
-const url = process.argv[2] || process.argv[process.argv.indexOf("--url") + 1];
-if (!url) {
-  console.error("❌ Bitte gib eine URL mit --url an");
+// ---------- Args ----------
+function getArg(name) {
+  const i = process.argv.indexOf(`--${name}`);
+  return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : null;
+}
+const url = getArg("url");
+if (!url || /^--/.test(url)) {
+  console.error("❌ Bitte starte mit:  node scrape-mydealz.js --url \"https://…\"");
   process.exit(1);
 }
 
-const outputDir = "shots";
-const pdfFile = "mydealz-output.pdf";
-if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir);
+// ---------- Helpers ----------
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-(async () => {
-  const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage({ viewport: { width: 1440, height: 2500 } });
+async function acceptCookies(page) {
+  const sels = [
+    "button:has-text('Akzeptieren')",
+    "button:has-text('Alle akzeptieren')",
+    "button:has-text('Einverstanden')",
+    "[data-testid='uc-accept-all-button']",
+  ];
+  for (const s of sels) {
+    const el = page.locator(s).first();
+    if (await el.isVisible().catch(() => false)) {
+      await el.click().catch(() => {});
+      await sleep(400);
+      break;
+    }
+  }
+}
 
-  console.log("🌐 Lade:", url);
-  await page.goto(url, { waitUntil: "networkidle" });
-  await page.waitForTimeout(3000);
+async function hideUI(page) {
+  await page.addStyleTag({
+    content: `
+      header, .header, [id*="cookie"], [class*="cookie"], [class*="sticky"],
+      .banner, .modal, .toast, .top-bar, .bottom-bar { display:none !important; }
+      ::-webkit-scrollbar { display:none!important; } body{scrollbar-width:none!important;}
+    `,
+  });
+}
 
-  // === ALLES AUSKLAPPEN ===
-  async function expandAll() {
-    let expanded = 0;
-    for (;;) {
-      const buttons = await page.$$('button:has-text("mehr")');
-      if (buttons.length === 0) break;
+async function ensureLoaded(page) {
+  await page.waitForSelector("h1, [data-test='thread-title']", { timeout: 20000 }).catch(() => {});
+}
 
-      for (const btn of buttons) {
+async function autoScroll(page, ms = 2000) {
+  const start = Date.now();
+  while (Date.now() - start < ms) {
+    await page.mouse.wheel(0, 1200);
+    await sleep(120);
+  }
+}
+
+async function detectPages(page, baseUrl) {
+  const nums = await page.$$eval("a[href*='page=']", (links) =>
+    Array.from(
+      new Set(
+        links
+          .map((a) => (a.href.match(/page=(\d+)/) || [])[1])
+          .filter(Boolean)
+          .map(Number)
+      )
+    )
+  );
+  const max = nums.length ? Math.max(...nums) : 1;
+  return Array.from({ length: max }, (_, i) => {
+    const u = new URL(baseUrl);
+    u.searchParams.set("page", i + 1);
+    u.hash = "comments";
+    return u.toString();
+  });
+}
+
+// klappt „mehr Antworten anzeigen“ & ähnliche, mehrere Runden
+async function expandAllReplies(page) {
+  let total = 0;
+  for (let round = 0; round < 20; round++) {
+    const items = await page.locator("button, a, div[role='button']").all();
+    let clicked = 0;
+    for (const it of items) {
+      const txt = ((await it.textContent()) || "").toLowerCase();
+      if (
+        txt.includes("mehr antworten anzeigen") ||
+        txt.includes("weitere antworten") ||
+        txt.includes("antworten anzeigen") ||
+        txt.includes("mehr anzeigen") ||
+        txt.includes("more replies") ||
+        txt.includes("view more")
+      ) {
         try {
-          await btn.click({ timeout: 1000 });
-          expanded++;
-          await page.waitForTimeout(300);
+          await it.scrollIntoViewIfNeeded();
+          await it.click({ timeout: 800 });
+          clicked++;
+          total++;
+          await sleep(200);
         } catch {}
       }
     }
-    console.log(`✅ Ausgeklappt: ${expanded} Bereiche`);
+    if (!clicked) break;
+    await autoScroll(page, 800);
+  }
+  return total;
+}
+
+async function screenshotFull(page, file) {
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await sleep(150);
+  await page.screenshot({ path: file, fullPage: true });
+}
+
+async function pngsToPdf(pngFiles, out) {
+  const pdf = await PDFDocument.create();
+  for (const p of pngFiles) {
+    const bytes = fs.readFileSync(p);
+    const img = await pdf.embedPng(bytes);
+    const w = img.width * 0.75;
+    const h = img.height * 0.75;
+    const pg = pdf.addPage([w, h]);
+    pg.drawImage(img, { x: 0, y: 0, width: w, height: h });
+  }
+  fs.writeFileSync(out, await pdf.save());
+}
+
+// ---------- Main ----------
+(async () => {
+  const browser = await chromium.launch({ headless: true });
+  const ctx = await browser.newContext({
+    viewport: { width: 1366, height: 900 },
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    locale: "de-DE",
+    timezoneId: "Europe/Berlin",
+  });
+  const page = await ctx.newPage();
+
+  console.log("→ Öffne:", url);
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90000 });
+  await acceptCookies(page);
+  await hideUI(page);
+  await ensureLoaded(page);
+
+  // Cloudflare warten
+  if (await page.locator("text=Verifying you are human").isVisible().catch(() => false)) {
+    console.log("⚠️ Cloudflare – warte 10s…");
+    await sleep(10000);
+    await page.reload({ waitUntil: "domcontentloaded" });
   }
 
-  await expandAll();
-  await page.waitForTimeout(2000);
+  await autoScroll(page, 1500);
+  const pages = await detectPages(page, url);
+  console.log("→ Kommentar-Unterseiten erkannt:", pages.length);
 
-  // === GANZE SEITE ALS SCREENSHOT(S) ===
-  const bodyHeight = await page.evaluate(() => document.body.scrollHeight);
-  const viewportHeight = page.viewportSize().height;
-  const totalShots = Math.ceil(bodyHeight / viewportHeight);
-  console.log(`📸 Seitenhöhe: ${bodyHeight}px → Screenshots: ${totalShots}`);
+  const dir = "shots";
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir);
+  const shots = [];
 
-  for (let i = 0; i < totalShots; i++) {
-    const y = i * viewportHeight;
-    await page.evaluate((_y) => window.scrollTo(0, _y), y);
-    await page.waitForTimeout(1000);
-    const file = path.join(outputDir, `shot-${String(i + 1).padStart(2, "0")}.png`);
-    await page.screenshot({ path: file, fullPage: false });
-    console.log(`✔ Screenshot gespeichert: ${file}`);
+  for (let i = 0; i < pages.length; i++) {
+    console.log(`=== Render ${i + 1}/${pages.length} ===`);
+    await page.goto(pages[i], { waitUntil: "domcontentloaded", timeout: 90000 });
+    await acceptCookies(page);
+    await hideUI(page);
+    await ensureLoaded(page);
+    await autoScroll(page, 2000);
+
+    const expanded = await expandAllReplies(page);
+    console.log("   ausgeklappt:", expanded);
+    await autoScroll(page, 1200);
+
+    const file = path.join(dir, `shot-${String(i + 1).padStart(2, "0")}.png`);
+    await screenshotFull(page, file);
+    shots.push(file);
+    console.log("   ✓ Screenshot:", file);
   }
 
-  // === PDF bauen ===
-  const pdfPath = path.join(".", pdfFile);
-  await page.pdf({ path: pdfPath, format: "A4", printBackground: true });
-  console.log(`📄 PDF erstellt: ${pdfPath}`);
+  const out = "mydealz-output.pdf";
+  await pngsToPdf(shots, out);
+  console.log("✓ PDF erstellt:", out);
 
   await browser.close();
-})();
+})().catch((e) => {
+  console.error("Fehler:", e);
+  process.exit(1);
+});
