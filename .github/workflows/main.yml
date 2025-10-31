@@ -24,12 +24,32 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
-            libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libgbm1 \
-            libpango-1.0-0 libasound2 fonts-liberation libappindicator3-1 \
-            libxshmfence1 libx11-xcb1 libxcursor1 libxi6 libxtst6 libxss1 wget
+          sudo apt-get install -y \
+            libnss3 \
+            libatk1.0-0 \
+            libatk-bridge2.0-0 \
+            libcups2 \
+            libdrm2 \
+            libxkbcommon0 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxrandr2 \
+            libgbm1 \
+            libpango-1.0-0 \
+            libpangoft2-1.0-0 \
+            fonts-liberation \
+            libappindicator3-1 \
+            libxshmfence1 \
+            libx11-xcb1 \
+            libxcursor1 \
+            libxi6 \
+            libxtst6 \
+            libxss1 \
+            wget \
+            libasound2t64 || true
+
           npm ci
-          npx playwright install --with-deps chromium
+          npx playwright install --with-deps chromium || true
 
       - name: Run scraper
         run: |
