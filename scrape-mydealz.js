@@ -154,7 +154,7 @@ async function buildPDF({ deal, comments, output = "mydealz-output.pdf" }) {
   return output;
 }
 
-// ---------- Navigation + expand ----------
+// ---------- Expand ----------
 async function expandAllReplies(page, maxRounds = 40) {
   let total = 0;
   for (let round = 1; round <= maxRounds; round++) {
@@ -178,6 +178,7 @@ async function expandAllReplies(page, maxRounds = 40) {
   return total;
 }
 
+// ---------- Main ----------
 async function main() {
   const url = arg("url");
   const ntfy = arg("ntfy", null);
@@ -193,7 +194,7 @@ async function main() {
     viewport: { width: 1366, height: 900 },
   });
 
-  // ⚠️ WICHTIG: Nur Bilder/Media/Fonts blocken – CSS & JS MÜSSEN LADEN!
+  // Nur große Medien blocken – CSS/JS MUSS laden
   await ctx.route("**/*", (route) => {
     const t = route.request().resourceType();
     if (t === "image" || t === "media" || t === "font") return route.abort();
@@ -216,7 +217,7 @@ async function main() {
     await sleep(500);
   }
 
-  // Start
+  // Startseite laden
   await nav(url);
 
   // Cookie/Consent schließen (falls vorhanden)
@@ -227,54 +228,77 @@ async function main() {
 
   const deal = await extractDealInfo(page);
 
-  // Alle Seiten finden
-  async function findAllPages() {
-    const urls = new Set([page.url()]);
-    for (let guard = 0; guard < 40; guard++) {
-      const relNext = await page.$("a[rel='next']");
-      if (relNext) {
-        const href = await relNext.getAttribute("href");
-        if (!href) break;
-        const abs = new URL(href, page.url()).toString();
-        if (urls.has(abs)) break;
-        urls.add(abs);
-        await nav(abs);
-        continue;
-      }
-      // Fallback: Link/Button mit "Nächste/Weiter"
-      const links = await page.$$("a,button");
-      let moved = false;
-      for (const h of links) {
-        const txt = ((await h.innerText().catch(() => "")) || "").trim();
-        if (PAGIN_NEXT_TEXT.test(txt)) {
-          const href = await h.getAttribute("href");
-          if (href) {
-            const abs = new URL(href, page.url()).toString();
-            if (!urls.has(abs)) {
-              urls.add(abs);
-              await nav(abs);
-              moved = true;
-            }
-          } else {
-            await h.click().catch(() => {});
-            await page.waitForLoadState("domcontentloaded").catch(() => {});
-            const u = page.url();
-            if (!urls.has(u)) {
-              urls.add(u);
-              moved = true;
-            }
-          }
-          break;
-        }
-      }
-      if (!moved) break;
-    }
-    return Array.from(urls);
+  // -------- Pagination (robust) --------
+  function buildPageUrl(base, n) {
+    const u = new URL(base);
+    u.searchParams.set("page", String(n));
+    // Kommentare-Anker anhängen (schadet nicht, hilft aber beim Scroll)
+    if (!u.hash) u.hash = "comments";
+    return u.toString();
   }
 
-  const pages = await findAllPages();
+  async function detectMaxPageFromDom() {
+    return await page.evaluate(() => {
+      // Sammle Zahlen aus Seiten-Links
+      const candidates = Array.from(document.querySelectorAll("a[href*='page=']"));
+      let max = 1;
+      for (const a of candidates) {
+        const href = a.getAttribute("href") || "";
+        const m = href.match(/[?&]page=(\d+)/);
+        if (m) max = Math.max(max, parseInt(m[1], 10));
+        const t = (a.innerText || a.textContent || "").trim();
+        const n = parseInt(t, 10);
+        if (!isNaN(n)) max = Math.max(max, n);
+      }
+      return max || 1;
+    });
+  }
 
-  // Seiten durchgehen
+  async function hasCommentsHere() {
+    return await page.evaluate(() => {
+      const nodes = document.querySelectorAll(
+        "[data-test*='comment'], [id^='comment'], article, li, .comment, .c-comment"
+      );
+      return nodes.length > 0;
+    });
+  }
+
+  async function findAllPagesRobust(startUrl) {
+    // 1) DOM lesen
+    let maxDom = await detectMaxPageFromDom();
+    if (maxDom > 1) {
+      console.log(`   Pagination im DOM gefunden: ${maxDom} Seiten`);
+      return Array.from({ length: maxDom }, (_, i) => buildPageUrl(startUrl, i + 1));
+    }
+
+    // 2) Fallback: sequentiell probieren (?page=2 …), bis keine Comments mehr gefunden werden
+    console.log("   Keine Pagination im DOM gefunden – probiere sequentiell …");
+    const urls = [buildPageUrl(startUrl, 1)];
+    let pageNo = 2;
+    let emptyHits = 0;
+    const MAX_PROBE = 60; // Sicherheitsgrenze
+    while (pageNo <= MAX_PROBE) {
+      const test = buildPageUrl(startUrl, pageNo);
+      await nav(test);
+      const ok = await hasCommentsHere();
+      if (!ok) {
+        emptyHits++;
+        if (emptyHits >= 2) break; // zwei leere in Folge → fertig
+      } else {
+        urls.push(test);
+        emptyHits = 0;
+      }
+      pageNo++;
+    }
+    // Zurück zur Seite 1
+    await nav(buildPageUrl(startUrl, 1));
+    return urls;
+  }
+
+  const pages = await findAllPagesRobust(page.url());
+  console.log(`==> Gefundene Seiten: ${pages.length}`);
+
+  // -------- Seiten durchgehen --------
   const all = [];
   for (let i = 0; i < pages.length; i++) {
     const p = pages[i];
@@ -288,7 +312,7 @@ async function main() {
     await sleep(250);
   }
 
-  // PDF bauen
+  // -------- PDF bauen --------
   const out = await buildPDF({ deal, comments: all, output: "mydealz-output.pdf" });
   console.log(`PDF erstellt: ${out} | Kommentare insgesamt: ${all.length}`);
 
