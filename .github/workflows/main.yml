@@ -4,36 +4,40 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: "Mydealz Deal/Thread URL (öffentlich)"
+        description: 'Mydealz Deal-URL'
+        type: string
         required: true
-      ntfy:
-        description: "ntfy URL (optional, z.B. https://ntfy.sh/mein-topic)"
-        required: false
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: 20
 
-      - name: Install project deps
-        run: npm install
+      - name: Install NPM deps
+        run: |
+          npm i --no-audit --no-fund
 
-      # 🧩 Richtige Playwright-Installation mit System-Dependencies
+      # Installiert Playwright + System-Abhängigkeiten & Browser
       - name: Install Playwright and dependencies
-        run: npx playwright install --with-deps chromium
+        uses: microsoft/playwright-github-action@v1
+        with:
+          with-deps: true
 
       - name: Run scraper
-        run: node scrape-mydealz.js --url "${{ inputs.url }}" ${{ inputs.ntfy && format('--ntfy {0}', inputs.ntfy) || '' }}
+        run: |
+          node scrape-mydealz.js --url "${{ github.event.inputs.url }}"
 
       - name: Upload PDF artifact
         uses: actions/upload-artifact@v4
         with:
           name: mydealz-pdf
           path: mydealz-output.pdf
+          if-no-files-found: error
