@@ -6,7 +6,6 @@ import { chromium } from "playwright";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 
 const BTN_TEXT = /(Mehr Antworten anzeigen|Weitere Antworten|Mehr Kommentare|Mehr anzeigen|Antworten anzeigen)/i;
-const PAGIN_NEXT_TEXT = /(Nächste|Weiter|›|»)/i;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const arg = (name, def = null) => {
@@ -14,7 +13,7 @@ const arg = (name, def = null) => {
   return i > 0 ? process.argv[i + 1] : def;
 };
 
-// ---------- Extraction helpers ----------
+/* -------------------- Extraction helpers -------------------- */
 async function extractDealInfo(page) {
   return await page.evaluate(() => {
     const pick = (el) => (el ? (el.innerText || el.textContent || "").trim() : "");
@@ -77,7 +76,7 @@ async function extractCommentsOnPage(page) {
   });
 }
 
-// ---------- PDF ----------
+/* -------------------- PDF -------------------- */
 async function buildPDF({ deal, comments, output = "mydealz-output.pdf" }) {
   const pdf = await PDFDocument.create();
   const font = await pdf.embedFont(StandardFonts.Helvetica);
@@ -154,12 +153,15 @@ async function buildPDF({ deal, comments, output = "mydealz-output.pdf" }) {
   return output;
 }
 
-// ---------- Expand ----------
-async function expandAllReplies(page, maxRounds = 40) {
+/* -------------------- Expand replies -------------------- */
+async function expandAllReplies(page, maxRounds = 50) {
   let total = 0;
   for (let round = 1; round <= maxRounds; round++) {
-    for (let i = 0; i < 10; i++) { await page.mouse.wheel(0, 1200); await sleep(120); }
-    const btns = page.locator("button, a[role='button'], a, div[role='button']").filter({ hasText: BTN_TEXT });
+    for (let i = 0; i < 10; i++) { await page.mouse.wheel(0, 1600); await sleep(120); }
+    const btns = page
+      .locator("button, a[role='button'], a, div[role='button']")
+      .filter({ hasText: BTN_TEXT });
+
     let clicked = 0;
     const n = await btns.count();
     for (let i = 0; i < n; i++) {
@@ -178,7 +180,7 @@ async function expandAllReplies(page, maxRounds = 40) {
   return total;
 }
 
-// ---------- Main ----------
+/* -------------------- Main -------------------- */
 async function main() {
   const url = arg("url");
   const ntfy = arg("ntfy", null);
@@ -194,7 +196,7 @@ async function main() {
     viewport: { width: 1366, height: 900 },
   });
 
-  // Nur große Medien blocken – CSS/JS MUSS laden
+  // WICHTIG: Nur Bilder/Media/Fonts blocken – CSS & JS müssen laden
   await ctx.route("**/*", (route) => {
     const t = route.request().resourceType();
     if (t === "image" || t === "media" || t === "font") return route.abort();
@@ -217,88 +219,129 @@ async function main() {
     await sleep(500);
   }
 
-  // Startseite laden
+  // Start
   await nav(url);
 
-  // Cookie/Consent schließen (falls vorhanden)
+  // Consent schließen (falls vorhanden)
   try {
-    const consent = page.locator("button:has-text('Akzeptieren'), button:has-text('Einverstanden'), button:has-text('Zustimmen')");
+    const consent = page.locator(
+      "button:has-text('Akzeptieren'), button:has-text('Einverstanden'), button:has-text('Zustimmen')"
+    );
     if (await consent.count()) await consent.first().click({ timeout: 2000 }).catch(() => {});
   } catch {}
 
   const deal = await extractDealInfo(page);
 
-  // -------- Pagination (robust) --------
+  /* -------------------- Robuste Pagination -------------------- */
   function buildPageUrl(base, n) {
     const u = new URL(base);
     u.searchParams.set("page", String(n));
-    // Kommentare-Anker anhängen (schadet nicht, hilft aber beim Scroll)
     if (!u.hash) u.hash = "comments";
     return u.toString();
   }
 
-  async function detectMaxPageFromDom() {
+  async function scrollToBottom() {
+    for (let i = 0; i < 25; i++) {
+      await page.mouse.wheel(0, 1600);
+      await sleep(120);
+    }
+  }
+
+  async function detectMaxPageFromDomDeep() {
+    await scrollToBottom();
     return await page.evaluate(() => {
-      // Sammle Zahlen aus Seiten-Links
-      const candidates = Array.from(document.querySelectorAll("a[href*='page=']"));
-      let max = 1;
-      for (const a of candidates) {
+      const nums = [];
+
+      // Links mit page=
+      document.querySelectorAll("a[href*='page=']").forEach((a) => {
         const href = a.getAttribute("href") || "";
         const m = href.match(/[?&]page=(\d+)/);
-        if (m) max = Math.max(max, parseInt(m[1], 10));
-        const t = (a.innerText || a.textContent || "").trim();
-        const n = parseInt(t, 10);
-        if (!isNaN(n)) max = Math.max(max, n);
+        if (m) nums.push(parseInt(m[1], 10));
+      });
+
+      // Pagination-Container: größte sichtbare Zahl
+      const containers = Array.from(
+        document.querySelectorAll(
+          "nav[aria-label*='Pagination' i], .pagination, [class*='Pagination'], [data-test*='pagination']"
+        )
+      );
+      if (containers.length) {
+        containers.forEach((c) => {
+          const text = (c.innerText || c.textContent || "").replace(/\s+/g, " ");
+          (text.match(/\d+/g) || []).forEach((n) => nums.push(parseInt(n, 10)));
+        });
       }
-      return max || 1;
+
+      // Fallback: gesamte Seite (realistische Begrenzung)
+      if (nums.length === 0) {
+        const txt = (document.body.innerText || "").replace(/\s+/g, " ");
+        (txt.match(/\d+/g) || []).forEach((n) => {
+          const v = parseInt(n, 10);
+          if (v >= 2 && v <= 200) nums.push(v);
+        });
+      }
+
+      const max = nums.length ? Math.max(...nums.filter((x) => !Number.isNaN(x))) : 1;
+      return Math.max(1, Math.min(max, 200));
     });
   }
 
-  async function hasCommentsHere() {
+  async function firstCommentSignature() {
     return await page.evaluate(() => {
-      const nodes = document.querySelectorAll(
-        "[data-test*='comment'], [id^='comment'], article, li, .comment, .c-comment"
-      );
-      return nodes.length > 0;
+      const n =
+        document.querySelector(
+          "[data-test*='comment'], [id^='comment'], article, li, .comment, .c-comment"
+        ) || null;
+      if (!n) return "";
+      const pick = (el) => (el ? (el.innerText || el.textContent || "").trim() : "");
+      const author =
+        pick(n.querySelector("a[href*='/profil'], [rel='author'], [data-test*='author'], [class*='author']")) || "—";
+      const timeEl = n.querySelector("time");
+      const time = (timeEl?.getAttribute("datetime") || pick(timeEl)) || "—";
+      const body =
+        n.querySelector("[data-test*='body'], [class*='body'], [class*='content'], .md, .markdown, p") || n;
+      const text = pick(body).slice(0, 80);
+      return `${author}|${time}|${text}`;
     });
   }
 
   async function findAllPagesRobust(startUrl) {
-    // 1) DOM lesen
-    let maxDom = await detectMaxPageFromDom();
+    // 1) DOM auslesen (bevorzugt)
+    let maxDom = await detectMaxPageFromDomDeep();
     if (maxDom > 1) {
-      console.log(`   Pagination im DOM gefunden: ${maxDom} Seiten`);
+      console.log(`   Pagination im DOM erkannt: ${maxDom} Seiten`);
       return Array.from({ length: maxDom }, (_, i) => buildPageUrl(startUrl, i + 1));
     }
 
-    // 2) Fallback: sequentiell probieren (?page=2 …), bis keine Comments mehr gefunden werden
+    // 2) Fallback: sequentiell mit Duplikaterkennung ("Clamp" auf letzter Seite)
     console.log("   Keine Pagination im DOM gefunden – probiere sequentiell …");
     const urls = [buildPageUrl(startUrl, 1)];
-    let pageNo = 2;
-    let emptyHits = 0;
-    const MAX_PROBE = 60; // Sicherheitsgrenze
-    while (pageNo <= MAX_PROBE) {
-      const test = buildPageUrl(startUrl, pageNo);
-      await nav(test);
-      const ok = await hasCommentsHere();
-      if (!ok) {
-        emptyHits++;
-        if (emptyHits >= 2) break; // zwei leere in Folge → fertig
-      } else {
-        urls.push(test);
-        emptyHits = 0;
+    await nav(urls[0]);
+    let lastSig = await firstCommentSignature();
+
+    const MAX_PROBE = 200;
+    for (let requested = 2; requested <= MAX_PROBE; requested++) {
+      const probe = buildPageUrl(startUrl, requested);
+      await nav(probe);
+
+      const sig = await firstCommentSignature();
+      if (!sig || sig === lastSig) {
+        const max = urls.length; // letzte echte Seite ist die bisherige Länge
+        console.log(`   Clamp/Ende erkannt – letzte gültige Seite: ${max}`);
+        return urls;
       }
-      pageNo++;
+
+      urls.push(probe);
+      lastSig = sig;
+      await sleep(120);
     }
-    // Zurück zur Seite 1
-    await nav(buildPageUrl(startUrl, 1));
     return urls;
   }
 
   const pages = await findAllPagesRobust(page.url());
   console.log(`==> Gefundene Seiten: ${pages.length}`);
 
-  // -------- Seiten durchgehen --------
+  /* -------------------- Iterate pages -------------------- */
   const all = [];
   for (let i = 0; i < pages.length; i++) {
     const p = pages[i];
@@ -312,7 +355,7 @@ async function main() {
     await sleep(250);
   }
 
-  // -------- PDF bauen --------
+  /* -------------------- Build PDF -------------------- */
   const out = await buildPDF({ deal, comments: all, output: "mydealz-output.pdf" });
   console.log(`PDF erstellt: ${out} | Kommentare insgesamt: ${all.length}`);
 
