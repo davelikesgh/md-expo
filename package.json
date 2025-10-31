@@ -1,10 +1,16 @@
 {
-  "name": "md-expo",
+  "name": "mydealz-exporter",
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "description": "Render MyDealz-Deals als Vollseiten-PDF mit ausgeklappten Kommentaren (Playwright + Stealth).",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
-    "start": "node scrape-mydealz.js"
+    "start": "node scrape-mydealz.js",
+    "scrape": "node scrape-mydealz.js --url",
+    "postinstall": "echo \"✔ deps installiert\""
   },
   "dependencies": {
     "pdf-lib": "^1.17.1",
