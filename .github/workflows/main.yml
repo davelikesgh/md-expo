@@ -25,11 +25,9 @@ jobs:
       - name: Install project deps
         run: npm install
 
-      - name: Install Playwright
-        uses: microsoft/playwright-github-action@v1
-        with:
-          with-deps: true
-          browsers: chromium
+      # 🧩 Richtige Playwright-Installation mit System-Dependencies
+      - name: Install Playwright and dependencies
+        run: npx playwright install --with-deps chromium
 
       - name: Run scraper
         run: node scrape-mydealz.js --url "${{ inputs.url }}" ${{ inputs.ntfy && format('--ntfy {0}', inputs.ntfy) || '' }}
