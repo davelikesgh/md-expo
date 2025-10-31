@@ -5,31 +5,31 @@ on:
     inputs:
       url:
         description: 'Mydealz Deal-URL'
-        type: string
         required: true
+        type: string
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Install NPM deps
+      - name: Install dependencies
         run: |
-          npm i --no-audit --no-fund
-
-      # Installiert Playwright + System-Abhängigkeiten & Browser
-      - name: Install Playwright and dependencies
-        uses: microsoft/playwright-github-action@v1
-        with:
-          with-deps: true
+          sudo apt-get update
+          sudo apt-get install -y libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+            libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libgbm1 \
+            libpango-1.0-0 libasound2 fonts-liberation libappindicator3-1 \
+            libxshmfence1 libx11-xcb1 libxcursor1 libxi6 libxtst6 libxss1 wget
+          npm ci
+          npx playwright install --with-deps chromium
 
       - name: Run scraper
         run: |
