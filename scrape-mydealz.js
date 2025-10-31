@@ -16,7 +16,7 @@ if (!dealUrl || /^--/.test(dealUrl)) {
   console.error('Nutze: node scrape-mydealz.js --url "https://…"');
   process.exit(1);
 }
-const PAGE_PROBE_CAP = Number(arg("cap") || process.env.PAGE_CAP || 6);
+const PAGE_PROBE_CAP = Number(arg("cap") || process.env.PAGE_CAP || 5);
 
 // ---------- Utils ----------
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -32,7 +32,7 @@ async function clickCookies(page) {
     const el = page.locator(s).first();
     if (await el.isVisible().catch(() => false)) {
       await el.click().catch(() => {});
-      await wait(300);
+      await wait(250);
       break;
     }
   }
@@ -53,7 +53,7 @@ async function ensureLoaded(page) {
   await page.waitForSelector("h1, [data-test='thread-title']", { timeout: 20000 }).catch(() => {});
 }
 
-async function scrollWarmup(page, ms = 1200) {
+async function scrollWarmup(page, ms = 1100) {
   const t0 = Date.now();
   while (Date.now() - t0 < ms) {
     await page.mouse.wheel(0, 1400);
@@ -80,7 +80,7 @@ async function expandAllReplies(page) {
           await c.scrollIntoViewIfNeeded();
           await c.click({ timeout: 800 });
           clicked++; total++;
-          await wait(150);
+          await wait(140);
         } catch {}
       }
     }
@@ -90,21 +90,18 @@ async function expandAllReplies(page) {
   return total;
 }
 
-// Signatur einer Seite: erste + letzte Kommentar-ID + Count
-async function pageSignature(page) {
-  const ids = await page.$$eval('*[id^="comment-"]', (els) => els.map(el => el.id));
-  if (!ids.length) return "";
-  const first = ids[0], last = ids[ids.length - 1];
-  return `${first}|${last}|${ids.length}`;
+// ALLE sichtbaren Kommentar-IDs sammeln (ohne Replies, die noch zugeklappt sind)
+async function collectCommentIds(page) {
+  return await page.$$eval('*[id^="comment-"]', (els) =>
+    els.map((el) => el.id.replace("comment-", "")).filter(Boolean)
+  );
 }
 
-// Naiv: PNG → PDF
 async function pngsToPdf(pngPaths, outPath) {
   const pdf = await PDFDocument.create();
   for (const p of pngPaths) {
     const bytes = fs.readFileSync(p);
     const img = await pdf.embedPng(bytes);
-    // leichte Skalierung, damit Seiten nicht riesig werden
     const scale = 0.75;
     const w = img.width * scale;
     const h = img.height * scale;
@@ -114,7 +111,6 @@ async function pngsToPdf(pngPaths, outPath) {
   fs.writeFileSync(outPath, await pdf.save());
 }
 
-// DOM-Pagination lesen (größte Seitenzahl aus der Paginierung)
 async function readDomMaxPage(page) {
   const nums = await page.$$eval("a[href*='page='], button[aria-label*='Seite']", (as) =>
     Array.from(
@@ -133,9 +129,8 @@ async function readDomMaxPage(page) {
   return nums.length ? Math.max(...nums) : 1;
 }
 
-// Robuste Seitenermittlung
+// Seiten entdecken – nur echte neue Inhalte zulassen
 async function discoverPages(page, baseUrl) {
-  // 1) DOM
   await scrollWarmup(page, 600);
   let domMax = await readDomMaxPage(page);
   if (domMax > 1) {
@@ -147,8 +142,7 @@ async function discoverPages(page, baseUrl) {
     });
   }
 
-  // 2) Fallback mit Signaturen & Redirect-Check
-  const seenSigs = new Set();
+  const seenIds = new Set();       // alle bisher gesehenen Kommentar-IDs
   const urls = [];
   const u0 = new URL(baseUrl);
   u0.hash = "comments";
@@ -156,10 +150,12 @@ async function discoverPages(page, baseUrl) {
   // Seite 1
   await page.goto(u0.toString(), { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
   await ensureLoaded(page);
-  await scrollWarmup(page, 800);
-  seenSigs.add(await pageSignature(page));
+  await scrollWarmup(page, 700);
+  const ids1 = await collectCommentIds(page);
+  ids1.forEach((id) => seenIds.add(id));
   urls.push(u0.toString());
 
+  // Weitere Seiten probieren
   for (let p = 2; p <= PAGE_PROBE_CAP; p++) {
     const u = new URL(baseUrl);
     u.searchParams.set("page", p);
@@ -169,18 +165,24 @@ async function discoverPages(page, baseUrl) {
     await ensureLoaded(page);
     await scrollWarmup(page, 600);
 
-    // tatsächliche Seite prüfen (Redirects auf page=1 bremsen hier)
+    // Redirect-Check: wirkliche Seite?
     const real = new URL(page.url());
     const realP = Number(real.searchParams.get("page") || "1");
     if (realP !== p) break;
 
-    const sig = await pageSignature(page);
-    if (!sig) break;
-    if (seenSigs.has(sig)) break; // bereits gesehen → keine neue Seite
-    seenSigs.add(sig);
+    // IDs vor dem Ausklappen sammeln (nur „native“ Comments der Seite)
+    const ids = await collectCommentIds(page);
+    const newIds = ids.filter((id) => !seenIds.has(id));
+
+    if (newIds.length === 0) break; // keine neuen Kommentare → keine echte neue Seite
+
+    // akzeptieren
+    newIds.forEach((id) => seenIds.add(id));
     urls.push(u.toString());
   }
-  return urls;
+
+  // URLs deduplizieren (Sicherheitsnetz)
+  return Array.from(new Set(urls));
 }
 
 (async () => {
@@ -200,7 +202,6 @@ async function discoverPages(page, baseUrl) {
   await hideOverlays(page);
   await ensureLoaded(page);
 
-  // Cloudflare Wartefenster abfangen
   if (await page.locator("text=Verifying you are human").isVisible().catch(() => false)) {
     console.log("⚠️ Cloudflare: 10s warten …");
     await wait(10000);
@@ -210,17 +211,18 @@ async function discoverPages(page, baseUrl) {
   const pages = await discoverPages(page, dealUrl);
   console.log("→ Kommentar-Unterseiten erkannt:", pages.length);
 
-  // Rendern
   if (!fs.existsSync("shots")) fs.mkdirSync("shots");
   const images = [];
+
   for (let i = 0; i < pages.length; i++) {
     console.log(`=== Render ${i + 1}/${pages.length} ===`);
     await page.goto(pages[i], { waitUntil: "domcontentloaded", timeout: 90000 });
     await clickCookies(page);
     await hideOverlays(page);
     await ensureLoaded(page);
-    await scrollWarmup(page, 1200);
+    await scrollWarmup(page, 1100);
 
+    // jetzt erst alles ausklappen und rendern
     const expanded = await expandAllReplies(page);
     console.log("   ausgeklappt:", expanded);
 
