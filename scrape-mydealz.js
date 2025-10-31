@@ -1,47 +1,68 @@
-// scrape-mydealz.js
+// scrape-mydealz.js (Optimierte MyDealz-Edition)
+// by ChatGPT 2025
 // Usage:
 //   node scrape-mydealz.js --url "https://www.mydealz.de/..." [--ntfy https://ntfy.sh/topic]
+
 import fs from "fs";
 import { chromium } from "playwright";
 import { PDFDocument, rgb } from "pdf-lib";
 import fontkit from "@pdf-lib/fontkit";
 
-// Nur echte Reply-Expander
 const BTN_TEXT = /(Mehr Antworten anzeigen|Weitere Antworten)/i;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const arg = (name, def = null) => {
-  const i = process.argv.indexOf("--" + name);
-  return i > 0 ? process.argv[i + 1] : def;
+const arg = (n, d = null) => {
+  const i = process.argv.indexOf("--" + n);
+  return i > 0 ? process.argv[i + 1] : d;
 };
 
-/* -------------------- Extraction helpers -------------------- */
-async function extractDealInfo(page) {
+/* ========== DEAL-INFOS EXTRAHIEREN ========== */
+async function extractDealHead(page) {
   return await page.evaluate(() => {
     const pick = (el) => (el ? (el.innerText || el.textContent || "").trim() : "");
-    const titleEl =
-      document.querySelector("[data-test='thread-title']") || document.querySelector("h1");
-    const descEl =
-      document.querySelector("[data-test*='description'], .threadBody, article .content, .userHtml") ||
-      document.querySelector("article");
-    const imgs = Array.from(document.querySelectorAll("img"))
-      .map((img) => img.getAttribute("src") || img.getAttribute("data-src"))
-      .filter(Boolean)
-      .slice(0, 12);
-    return {
-      title: pick(titleEl) || "Mydealz Thread",
-      description: pick(descEl),
-      images: imgs
-    };
+    const out = {};
+
+    out.title =
+      pick(document.querySelector("[data-test='thread-title']")) ||
+      pick(document.querySelector("h1")) ||
+      "MyDealz Deal";
+
+    out.price =
+      pick(document.querySelector("[data-test='thread-price']")) ||
+      pick(document.querySelector(".thread-price")) ||
+      "";
+
+    out.merchant =
+      pick(document.querySelector("[data-test='merchant-name']")) ||
+      pick(document.querySelector("[class*='merchant']")) ||
+      "";
+
+    out.expiry =
+      pick(document.querySelector("[data-test='deal-expiry-date']")) ||
+      pick(document.querySelector("[class*='deal-expiry']")) ||
+      "";
+
+    out.link = document.querySelector("a[data-test='thread-deal-link']")?.href || location.href;
+
+    out.description =
+      pick(document.querySelector("[data-test*='description'], .threadBody, article .content, .userHtml")) ||
+      "";
+
+    out.images = Array.from(document.querySelectorAll("img"))
+      .map((img) => img.src)
+      .filter((x) => x && !x.startsWith("data:"))
+      .slice(0, 10);
+
+    return out;
   });
 }
 
-async function extractCommentsOnPage(page) {
+/* ========== KOMMENTARE EXTRAHIEREN ========== */
+async function extractComments(page) {
   return await page.evaluate(() => {
     const out = [];
     const nodes = document.querySelectorAll(
       "[data-test*='comment'], [id^='comment'], .c-comment, .comment"
     );
-
     const txt = (el) => (el?.innerText || el?.textContent || "").trim();
 
     const depthOf = (el) => {
@@ -56,102 +77,132 @@ async function extractCommentsOnPage(page) {
 
     for (const el of nodes) {
       const body =
-        el.querySelector("[data-test*='body'], [class*='body'], [class*='content'], .md, .markdown, p") || el;
-      const t = txt(body);
-      if (!t || t.length < 2) continue;
+        el.querySelector("[data-test*='body'], [class*='body'], .md, .markdown, p") || el;
+      const text = txt(body);
+      if (!text || text.length < 3) continue;
 
-      const authorEl = el.querySelector("a[href*='/profil'], [rel='author'], [data-test*='author'], [class*='author']");
+      const author = txt(
+        el.querySelector("a[href*='/profil'], [rel='author'], [data-test*='author'], [class*='author']")
+      ) || "—";
       const timeEl = el.querySelector("time");
-      const scoreEl = el.querySelector("[data-test*='vote'], [class*='vote'], [aria-label*='Gefällt']");
+      const time = timeEl?.getAttribute("datetime") || txt(timeEl) || "—";
+      const score = txt(el.querySelector("[data-test*='vote'], [class*='vote'], [aria-label*='Gefällt']"));
 
       out.push({
-        author: txt(authorEl) || "—",
-        datetime: (timeEl?.getAttribute("datetime") || txt(timeEl)) || "—",
-        score: (scoreEl?.getAttribute?.("aria-label") || txt(scoreEl)) || "",
-        text: t,
-        depth: depthOf(el)
+        author,
+        datetime: time,
+        score,
+        text,
+        depth: depthOf(el),
       });
     }
     return out;
   });
 }
 
-/* -------------------- PDF (Unicode-Font mit fontkit) -------------------- */
+/* ========== DEDUPLIKATION ========== */
+function deduplicate(comments) {
+  const seen = new Set();
+  return comments.filter((c) => {
+    const key = c.author + "|" + c.text.slice(0, 50);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+/* ========== REPLIES EXPANDIEREN ========== */
+async function expandAllReplies(page, maxRounds = 10) {
+  let total = 0;
+  const start = Date.now();
+  for (let round = 1; round <= maxRounds; round++) {
+    const buttons = page
+      .locator("[data-test*='comment'] >> :is(button,a[role='button'],a,div[role='button'])")
+      .filter({ hasText: BTN_TEXT });
+
+    const n = await buttons.count();
+    if (n === 0) break;
+
+    let clicked = 0;
+    for (let i = 0; i < n; i++) {
+      try {
+        const b = buttons.nth(i);
+        await b.scrollIntoViewIfNeeded();
+        await b.click({ timeout: 800 });
+        clicked++;
+        total++;
+        await sleep(60);
+      } catch {}
+    }
+
+    console.log(`expand: Runde ${round} — ${clicked} Buttons`);
+    if (clicked === 0 || Date.now() - start > 60_000) break;
+    await sleep(300);
+  }
+  return total;
+}
+
+/* ========== PDF-ERSTELLUNG ========== */
 function findFontPath() {
   const candidates = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
   ];
-  for (const p of candidates) {
-    try { if (fs.existsSync(p)) return p; } catch {}
-  }
-  throw new Error("Kein Unicode-Font gefunden (DejaVuSans / NotoSans).");
+  for (const c of candidates) if (fs.existsSync(c)) return c;
+  throw new Error("Kein Unicode-Font gefunden.");
 }
 
-async function buildPDF({ deal, comments, output = "mydealz-output.pdf" }) {
+async function makePDF({ deal, comments, output = "mydealz-output.pdf" }) {
   const pdf = await PDFDocument.create();
   pdf.registerFontkit(fontkit);
 
-  const fontPath = findFontPath();
-  const fontBytes = fs.readFileSync(fontPath);
-  const font = await pdf.embedFont(fontBytes, { subset: true });
+  const font = await pdf.embedFont(fs.readFileSync(findFontPath()), { subset: true });
 
-  let page = pdf.addPage([595.28, 841.89]); // A4
+  let page = pdf.addPage([595.28, 841.89]);
   const margin = 36;
-  const lineH = 12;
-  const maxWidth = page.getWidth() - margin * 2;
+  const width = page.getWidth() - margin * 2;
   let y = page.getHeight() - margin;
+  const lh = 12;
 
-  const newPage = () => {
-    page = pdf.addPage([595.28, 841.89]);
-    y = page.getHeight() - margin;
-  };
-
-  const wrap = (text, f, size, width) => {
-    const words = (text || "").split(/\s+/);
-    const lines = [];
-    let line = "";
-    for (const w of words) {
-      const cand = line ? line + " " + w : w;
-      if (f.widthOfTextAtSize(cand, size) > width && line) {
-        lines.push(line);
-        line = w;
-      } else line = cand;
-    }
-    if (line) lines.push(line);
-    return lines.flatMap((ln) => ln.split(/\n/));
-  };
+  const newPage = () => { page = pdf.addPage([595.28, 841.89]); y = page.getHeight() - margin; };
 
   const draw = (text, { size = 10, color = rgb(0, 0, 0), indent = 0 } = {}) => {
-    const width = maxWidth - indent;
-    const lines = wrap(text, font, size, width);
-    for (const ln of lines) {
-      if (y - lineH < margin) newPage();
-      page.drawText(ln, { x: margin + indent, y: y - lineH, size, font, color });
-      y -= lineH;
+    const lines = (text || "").split(/\r?\n/);
+    for (const l of lines) {
+      if (y - lh < margin) newPage();
+      page.drawText(l, { x: margin + indent, y: y - lh, size, font, color });
+      y -= lh;
     }
   };
 
-  draw(deal.title, { size: 14, color: rgb(0, 0, 0.6) });
-  if (deal.description) {
-    draw("\nDealbeschreibung", { size: 11 });
-    draw(deal.description, { size: 10 });
-  }
-  if (deal.images?.length) {
-    draw("\nBilder (URLs):", { size: 11 });
-    for (const u of deal.images) draw(u, { size: 9, color: rgb(0.3, 0.3, 0.3) });
+  /* Kopfbereich */
+  draw(deal.title, { size: 15, color: rgb(0.1, 0.1, 0.5) });
+  draw("");
+  draw(`💰 Preis: ${deal.price}`);
+  draw(`🏷️ Händler: ${deal.merchant}`);
+  draw(`📅 Ablaufdatum: ${deal.expiry}`);
+  draw(`🔗 Link: ${deal.link}`);
+  draw("");
+  draw("📝 Beschreibung:");
+  draw(deal.description);
+  if (deal.images.length) {
+    draw("");
+    draw("🖼️ Bilder (URLs):");
+    deal.images.forEach((u) => draw(u, { size: 8, color: rgb(0.3, 0.3, 0.3) }));
   }
 
-  draw("\nKommentare:", { size: 11 });
-  draw(`Gesamt: ${comments.length}`, { size: 9, color: rgb(0.3, 0.3, 0.3) });
+  draw("");
+  draw("──────────────────────────────", { color: rgb(0.2, 0.2, 0.2) });
+  draw("");
+  draw(`💬 Kommentare (${comments.length}):`);
+  draw("");
 
   for (const c of comments) {
-    const indent = Math.min(8, Math.max(0, c.depth || 0)) * 12;
+    const indent = Math.min(8, c.depth) * 12;
     draw(`${c.author} — ${c.datetime}${c.score ? " — " + c.score : ""}`, { size: 9, indent });
     draw(c.text, { size: 9, indent });
     y -= 6;
-    if (y < margin + 40) newPage();
+    if (y < margin + 50) newPage();
   }
 
   const bytes = await pdf.save();
@@ -159,177 +210,67 @@ async function buildPDF({ deal, comments, output = "mydealz-output.pdf" }) {
   return output;
 }
 
-/* -------------------- Expand replies (präzise & schnell) -------------------- */
-async function expandAllReplies(page, maxRounds = 15) {
-  const PAGE_MAX_MS = 90_000;
-  const t0 = Date.now();
-  let total = 0;
-
-  for (let round = 1; round <= maxRounds; round++) {
-    for (let i = 0; i < 6; i++) { await page.mouse.wheel(0, 1400); await sleep(80); }
-
-    const buttons = page
-      .locator("[data-test*='comment'] >> :is(button, a[role='button'], a, div[role='button'])")
-      .filter({ hasText: BTN_TEXT });
-
-    let n = await buttons.count();
-    if (n === 0) {
-      await sleep(200);
-      n = await buttons.count();
-      if (n === 0) break;
-    }
-
-    let clicked = 0;
-    for (let i = 0; i < n; i++) {
-      try {
-        const b = buttons.nth(i);
-        await b.scrollIntoViewIfNeeded();
-        await b.click({ timeout: 1000 });
-        clicked++;
-        total++;
-        await sleep(60);
-      } catch {}
-      if (Date.now() - t0 > PAGE_MAX_MS) break;
-    }
-
-    console.log(`expand: Runde ${round} — geklickt ${clicked} (gesamt ${total})`);
-    if (clicked === 0) break;
-    if (Date.now() - t0 > PAGE_MAX_MS) {
-      console.log("   Abbruch: Zeitlimit pro Seite erreicht");
-      break;
-    }
-    await sleep(200);
-  }
-  return total;
-}
-
-/* -------------------- Main -------------------- */
+/* ========== MAIN ========== */
 async function main() {
   const url = arg("url");
-  const ntfy = arg("ntfy", null);
   if (!url) {
-    console.error('Usage: node scrape-mydealz.js --url "https://www.mydealz.de/..." [--ntfy https://ntfy.sh/topic]');
+    console.error("Usage: node scrape-mydealz.js --url <DealURL>");
     process.exit(1);
   }
 
   const browser = await chromium.launch({ headless: true });
-  const ctx = await browser.newContext({
-    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    viewport: { width: 1366, height: 900 }
-  });
+  const ctx = await browser.newContext({ viewport: { width: 1366, height: 900 } });
 
-  // CSS/JS erlauben, nur Images/Media/Fonts blocken
   await ctx.route("**/*", (route) => {
     const t = route.request().resourceType();
-    if (t === "image" || t === "media" || t === "font") return route.abort();
-    return route.continue();
+    if (["image", "media", "font"].includes(t)) return route.abort();
+    route.continue();
   });
 
   const page = await ctx.newPage();
-  page.setDefaultTimeout(120000);
+  page.setDefaultTimeout(60_000);
 
-  async function nav(u) {
-    console.log("→ Lade:", u);
-    try { await page.goto(u, { waitUntil: "domcontentloaded", timeout: 60000 }); }
-    catch (e) { console.log("   goto warn:", e.message); }
-    await sleep(500);
-  }
+  console.log("→ Lade Deal:", url);
+  await page.goto(url, { waitUntil: "domcontentloaded" });
+  await sleep(1000);
 
-  await nav(url);
-  const deal = await extractDealInfo(page);
+  const deal = await extractDealHead(page);
+  console.log("✓ Dealkopf geladen:", deal.title);
 
-  function buildPageUrl(base, n) {
-    const u = new URL(base);
-    u.searchParams.set("page", String(n));
-    if (!u.hash) u.hash = "comments";
-    return u.toString();
-  }
-
-  async function firstCommentSignature() {
-    return await page.evaluate(() => {
-      const n =
-        document.querySelector("[data-test*='comment'], [id^='comment'], .c-comment, .comment") || null;
-      if (!n) return "";
-      const pick = (el) => (el ? (el.innerText || el.textContent || "").trim() : "");
-      const author = pick(n.querySelector("a[href*='/profil'], [rel='author']")) || "—";
-      const timeEl = n.querySelector("time");
-      const time = (timeEl?.getAttribute("datetime") || pick(timeEl)) || "—";
-      const body = n.querySelector("[data-test*='body'], [class*='body'], .md, .markdown, p") || n;
-      const text = pick(body).slice(0, 80);
-      return `${author}|${time}|${text}`;
+  // Seiten finden
+  const pages = await page.evaluate(() => {
+    const arr = [];
+    document.querySelectorAll("a[href*='page=']").forEach((a) => {
+      const m = a.href.match(/page=(\d+)/);
+      if (m) arr.push(parseInt(m[1]));
     });
-  }
-
-  async function findAllPagesRobust(startUrl) {
-    for (let i = 0; i < 10; i++) { await page.mouse.wheel(0, 1500); await sleep(100); }
-    console.log("   Suche Pagination im DOM …");
-
-    let maxPage = await page.evaluate(() => {
-      const isVisible = (el) => {
-        const cs = getComputedStyle(el);
-        if (cs.display === "none" || cs.visibility === "hidden" || cs.opacity === "0") return false;
-        if (el.closest("[hidden],[aria-hidden='true']")) return false;
-        return true;
-      };
-      const nums = [];
-      document.querySelectorAll("a[href*='page=']").forEach((a) => {
-        if (!isVisible(a)) return;
-        const m = (a.getAttribute("href") || "").match(/[?&]page=(\d+)/);
-        if (m) nums.push(parseInt(m[1], 10));
-        const t = parseInt((a.textContent || "").trim(), 10);
-        if (!Number.isNaN(t)) nums.push(t);
-      });
-      const max = nums.length ? Math.max(...nums) : 1;
-      return Math.max(1, Math.min(max, 50));
-    });
-
-    if (maxPage > 1 && maxPage <= 50) {
-      console.log(`   Pagination im DOM erkannt: ${maxPage} Seiten`);
-      return Array.from({ length: maxPage }, (_, i) => buildPageUrl(startUrl, i + 1));
-    }
-
-    console.log("   DOM-Erkennung unklar – prüfe Seiten sequentiell …");
-    const urls = [buildPageUrl(startUrl, 1)];
-    await nav(urls[0]);
-    let lastSig = await firstCommentSignature();
-
-    for (let i = 2; i <= 50; i++) {
-      const test = buildPageUrl(startUrl, i);
-      await nav(test);
-      const sig = await firstCommentSignature();
-      if (!sig || sig === lastSig) {
-        console.log(`   Ende erkannt – letzte gültige Seite: ${i - 1}`);
-        return urls;
-      }
-      urls.push(test);
-      lastSig = sig;
-      await sleep(150);
-    }
-    return urls;
-  }
-
-  const pages = await findAllPagesRobust(page.url());
-  console.log(`==> Gefundene Seiten: ${pages.length}`);
+    return [...new Set(arr)].sort((a, b) => a - b);
+  });
+  const totalPages = pages.length || 1;
+  console.log("→ Kommentar-Seiten erkannt:", totalPages);
 
   const all = [];
-  for (let i = 0; i < pages.length; i++) {
-    const p = pages[i];
-    console.log(`\n=== Seite ${i + 1}/${pages.length} ===`);
-    await nav(p);
-    const clicks = await expandAllReplies(page, 15);
-    const part = await extractCommentsOnPage(page);
-    console.log(`   ausgeklappt: ${clicks} | extrahiert: ${part.length}`);
+
+  for (let i = 1; i <= totalPages; i++) {
+    const pageUrl = i === 1 ? url : url + (url.includes("?") ? "&" : "?") + "page=" + i + "#comments";
+    console.log(`\n=== Seite ${i}/${totalPages} ===`);
+    await page.goto(pageUrl, { waitUntil: "domcontentloaded" });
+    await expandAllReplies(page);
+    const part = await extractComments(page);
     all.push(...part);
-    console.log(`   Gesamt-Kommentare bisher: ${all.length}`);
+    console.log(`   +${part.length} Kommentare`);
   }
 
-  const out = await buildPDF({ deal, comments: all, output: "mydealz-output.pdf" });
-  console.log(`PDF erstellt: ${out} | Kommentare insgesamt: ${all.length}`);
+  const deduped = deduplicate(all);
+  console.log(`→ Gesamt: ${all.length} | Nach Dedupe: ${deduped.length}`);
+
+  const out = await makePDF({ deal, comments: deduped });
+  console.log("✓ PDF erstellt:", out);
 
   await browser.close();
 }
 
 main().catch((e) => {
-  console.error(e);
+  console.error("Fehler:", e);
   process.exit(1);
 });
