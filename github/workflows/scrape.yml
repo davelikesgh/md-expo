@@ -1,0 +1,35 @@
+name: Mydealz → Eine PDF
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Mydealz Deal/Thread URL (öffentlich)"
+        required: true
+      ntfy:
+        description: "ntfy URL (optional, z.B. https://ntfy.sh/mein-topic)"
+        required: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Run scraper
+        run: node scrape-mydealz.js --url "${{ inputs.url }}" ${{ inputs.ntfy && format('--ntfy {0}', inputs.ntfy) || '' }}
+
+      - name: Upload PDF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mydealz-pdf
+          path: mydealz-output.pdf
