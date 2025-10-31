@@ -13,18 +13,24 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 120   # groß, weil 8k+ Kommentare
+    timeout-minutes: 120
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: "npm"
 
-      - name: Install dependencies
-        run: |
-          npm install
-          npx playwright install --with-deps chromium
+      - name: Install project deps
+        run: npm install
+
+      - name: Install Playwright
+        uses: microsoft/playwright-github-action@v1
+        with:
+          with-deps: true
+          browsers: chromium
 
       - name: Run scraper
         run: node scrape-mydealz.js --url "${{ inputs.url }}" ${{ inputs.ntfy && format('--ntfy {0}', inputs.ntfy) || '' }}
