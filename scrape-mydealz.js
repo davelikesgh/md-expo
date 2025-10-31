@@ -11,8 +11,8 @@ function getArg(name) {
   const i = process.argv.indexOf(`--${name}`);
   return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : null;
 }
-const url = getArg("url");
-if (!url || /^--/.test(url)) {
+const dealUrl = getArg("url");
+if (!dealUrl || /^--/.test(dealUrl)) {
   console.error("❌ Bitte starte mit:  node scrape-mydealz.js --url \"https://…\"");
   process.exit(1);
 }
@@ -59,26 +59,6 @@ async function autoScroll(page, ms = 2000) {
   }
 }
 
-async function detectPages(page, baseUrl) {
-  const nums = await page.$$eval("a[href*='page=']", (links) =>
-    Array.from(
-      new Set(
-        links
-          .map((a) => (a.href.match(/page=(\d+)/) || [])[1])
-          .filter(Boolean)
-          .map(Number)
-      )
-    )
-  );
-  const max = nums.length ? Math.max(...nums) : 1;
-  return Array.from({ length: max }, (_, i) => {
-    const u = new URL(baseUrl);
-    u.searchParams.set("page", i + 1);
-    u.hash = "comments";
-    return u.toString();
-  });
-}
-
 // klappt „mehr Antworten anzeigen“ & ähnliche, mehrere Runden
 async function expandAllReplies(page) {
   let total = 0;
@@ -97,10 +77,9 @@ async function expandAllReplies(page) {
       ) {
         try {
           await it.scrollIntoViewIfNeeded();
-          await it.click({ timeout: 800 });
-          clicked++;
-          total++;
-          await sleep(200);
+          await it.click({ timeout: 900 });
+          clicked++; total++;
+          await sleep(220);
         } catch {}
       }
     }
@@ -121,12 +100,57 @@ async function pngsToPdf(pngFiles, out) {
   for (const p of pngFiles) {
     const bytes = fs.readFileSync(p);
     const img = await pdf.embedPng(bytes);
-    const w = img.width * 0.75;
-    const h = img.height * 0.75;
-    const pg = pdf.addPage([w, h]);
-    pg.drawImage(img, { x: 0, y: 0, width: w, height: h });
+    const scale = 0.75; // A4-freundliche Größe
+    const w = img.width * scale;
+    const h = img.height * scale;
+    const page = pdf.addPage([w, h]);
+    page.drawImage(img, { x: 0, y: 0, width: w, height: h });
   }
   fs.writeFileSync(out, await pdf.save());
+}
+
+// ---- robuste Seitenerkennung ----
+async function discoverAllCommentPages(page, baseUrl) {
+  // 1) DOM-Scan (Paginierung kann unten stehen)
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  await sleep(800);
+
+  const domPages = await page.$$eval("a[href*='page=']", (links) =>
+    Array.from(
+      new Set(
+        links
+          .map((a) => (a.href.match(/page=(\d+)/) || [])[1])
+          .filter(Boolean)
+          .map(Number)
+      )
+    )
+  );
+  let max = domPages.length ? Math.max(...domPages) : 1;
+
+  // 2) Fallback: sequentiell probieren (endet sobald Seite „zurückspringt“)
+  if (max < 2) {
+    const urlObj = new URL(baseUrl);
+    for (let p = 2; p <= 50; p++) {
+      const test = new URL(urlObj.toString());
+      test.searchParams.set("page", p);
+      test.hash = "comments";
+      await page.goto(test.toString(), { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+      // Wenn die URL nach dem Laden NICHT auf page=p steht, gibt es diese Seite nicht
+      const curP = Number(new URL(page.url()).searchParams.get("page") || "1");
+      if (curP !== p) break;
+      max = p;
+    }
+    // zurück auf Seite 1
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+  }
+
+  // 3) Liste 1..max bauen
+  return Array.from({ length: max }, (_, i) => {
+    const u = new URL(baseUrl);
+    u.searchParams.set("page", i + 1);
+    u.hash = "comments";
+    return u.toString();
+  });
 }
 
 // ---------- Main ----------
@@ -141,8 +165,8 @@ async function pngsToPdf(pngFiles, out) {
   });
   const page = await ctx.newPage();
 
-  console.log("→ Öffne:", url);
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90000 });
+  console.log("→ Öffne:", dealUrl);
+  await page.goto(dealUrl, { waitUntil: "domcontentloaded", timeout: 90000 });
   await acceptCookies(page);
   await hideUI(page);
   await ensureLoaded(page);
@@ -155,9 +179,12 @@ async function pngsToPdf(pngFiles, out) {
   }
 
   await autoScroll(page, 1500);
-  const pages = await detectPages(page, url);
+
+  // → alle Kommentar-Unterseiten ermitteln
+  const pages = await discoverAllCommentPages(page, dealUrl);
   console.log("→ Kommentar-Unterseiten erkannt:", pages.length);
 
+  // → jede Seite rendern
   const dir = "shots";
   if (!fs.existsSync(dir)) fs.mkdirSync(dir);
   const shots = [];
